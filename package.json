@@ -1,0 +1,22 @@
+{
+  "name": "fluid-simulation",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.4",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.2"
+  },
+  "dependencies": {
+    "install": "^0.13.0",
+    "lil-gui": "^0.21.0",
+    "npm": "^11.19.1",
+    "three": "^0.186.0"
+  }
+}
