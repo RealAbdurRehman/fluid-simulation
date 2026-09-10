@@ -6,35 +6,43 @@ import { setParticleSize, setParticleGridPosition, start } from "./simulation";
 const gui = new GUI();
 
 const config = {
-  paused: false,
+  paused: true,
+
   gravity: 0,
-  collisionDamping: 1,
+  collisionDamping: 0.5,
+
+  targetDensity: 2.75,
+  pressureMultiplier: 10,
+  smoothingRadius: 1.2,
+
+  numParticles: 100,
   particleSize: 0.5,
+  particleSpacing: 0.1,
+
+  boundsSize: 30,
   cameraDistance: 50,
-  boundsSize: 50,
-  numParticles: 1,
-  particleSpacing: 0,
-  smoothingRadius: 1,
 };
 
 const simulationFolder = gui.addFolder("Simulation");
 simulationFolder.add(config, "paused");
-simulationFolder.add(config, "gravity", -100, 100);
+simulationFolder.add(config, "gravity", -50, 50);
 simulationFolder.add(config, "collisionDamping", 0, 1);
 simulationFolder
-  .add(config, "boundsSize", 30, 150)
+  .add(config, "boundsSize", 10, 100)
   .onChange((size: number) => setBoundsSize(size));
+simulationFolder.add(config, "targetDensity", 0.5, 6);
+simulationFolder.add(config, "pressureMultiplier", 0, 50);
 
 const particleFolder = gui.addFolder("Particles");
-particleFolder.add(config, "numParticles", 1, 500, 1).onChange(() => start());
+particleFolder.add(config, "numParticles", 1, 300, 1).onChange(() => start());
 particleFolder
-  .add(config, "particleSpacing", 0, 4)
+  .add(config, "particleSpacing", 0, 2)
   .onChange(() => setParticleGridPosition());
-particleFolder.add(config, "particleSize", 0.1, 10).onChange((size: number) => {
+particleFolder.add(config, "particleSize", 0.1, 3).onChange((size: number) => {
   setParticleSize(size);
   setParticleGridPosition();
 });
-particleFolder.add(config, "smoothingRadius", 1, 5);
+particleFolder.add(config, "smoothingRadius", 0.5, 5);
 
 const cameraFolder = gui.addFolder("Camera");
 cameraFolder

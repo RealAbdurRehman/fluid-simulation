@@ -8,7 +8,10 @@ const DOWN: THREE.Vector2 = new THREE.Vector2(0, -1);
 const positions: THREE.Vector2[] = [];
 const velocities: THREE.Vector2[] = [];
 
+const particleMass = 1;
+
 const particles: THREE.Mesh[] = [];
+const densities: number[] = [];
 
 function getHalfBounds(): THREE.Vector2 {
   return new THREE.Vector2().setScalar(
@@ -36,6 +39,8 @@ function setParticleGridPosition(): void {
     positions[i].set(x, y);
     particles[i].position.set(x, y);
   }
+
+  updateDensities();
 }
 
 function clearParticles(): void {
@@ -44,6 +49,7 @@ function clearParticles(): void {
   particles.length = 0;
   positions.length = 0;
   velocities.length = 0;
+  densities.length = 0;
 }
 
 function start(): void {
@@ -55,10 +61,81 @@ function start(): void {
     const particleInstance = particle.clone();
     particleInstance.scale.setScalar(config.particleSize);
     particles.push(particleInstance);
+
     scene.add(particleInstance);
   }
 
   setParticleGridPosition();
+}
+
+function smoothingKernel(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
+  return ((radius - distance) * (radius - distance)) / volume;
+}
+
+function smoothingKernelDerivative(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const scale = 12 / (Math.PI * Math.pow(radius, 4));
+  return (distance - radius) * scale;
+}
+
+function calculateDensity(point: THREE.Vector2): number {
+  let density = 0;
+  for (const position of positions) {
+    const distance = position.distanceTo(point);
+    const influence = smoothingKernel(config.smoothingRadius, distance);
+    density += particleMass * influence;
+  }
+
+  return density;
+}
+
+function updateDensities(): void {
+  for (let i = 0; i < config.numParticles; i++)
+    densities[i] = calculateDensity(positions[i]);
+}
+
+function convertDensityToPressure(density: number): number {
+  const densityError = density - config.targetDensity;
+  const pressure = densityError * config.pressureMultiplier;
+  return pressure;
+}
+
+function calculateSharedPressure(densityA: number, densityB: number): number {
+  const pressureA = convertDensityToPressure(densityA);
+  const pressureB = convertDensityToPressure(densityB);
+  return (pressureA + pressureB) / 2;
+}
+
+function calculatePressureForce(particleIndex: number): THREE.Vector2 {
+  const pressureForce = new THREE.Vector2();
+  for (let i = 0; i < config.numParticles; i++) {
+    if (i === particleIndex) continue;
+
+    const distance = positions[i].distanceTo(positions[particleIndex]);
+    if (distance === 0) continue;
+
+    const direction = positions[i]
+      .clone()
+      .sub(positions[particleIndex])
+      .divideScalar(distance);
+    const slope = smoothingKernelDerivative(config.smoothingRadius, distance);
+
+    const density = densities[i];
+    if (density <= 0) continue;
+
+    const sharedPressure = calculateSharedPressure(
+      density,
+      densities[particleIndex],
+    );
+    const scalar = (-sharedPressure * slope * particleMass) / density;
+    pressureForce.addScaledVector(direction, scalar);
+  }
+
+  return pressureForce;
 }
 
 function resolveCollisions(
@@ -80,13 +157,23 @@ function update(delta: number): void {
   if (config.paused) return;
 
   for (let i = 0; i < config.numParticles; i++) {
-    const velocity = velocities[i],
-      position = positions[i];
-    velocity.addScaledVector(DOWN, config.gravity * delta);
-    position.addScaledVector(velocity, delta);
-    resolveCollisions(position, velocity);
+    velocities[i].addScaledVector(DOWN, config.gravity * delta);
+    densities[i] = calculateDensity(positions[i]);
+  }
 
-    particles[i].position.set(position.x, position.y);
+  for (let i = 0; i < config.numParticles; i++) {
+    const density = densities[i];
+    if (density <= 0) continue;
+
+    const pressureForce = calculatePressureForce(i);
+    const pressureAcceleration = pressureForce.divideScalar(density);
+    velocities[i].addScaledVector(pressureAcceleration, delta);
+  }
+
+  for (let i = 0; i < config.numParticles; i++) {
+    positions[i].addScaledVector(velocities[i], delta);
+    resolveCollisions(positions[i], velocities[i]);
+    particles[i].position.set(positions[i].x, positions[i].y);
   }
 }
 
