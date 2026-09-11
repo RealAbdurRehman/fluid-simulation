@@ -58,11 +58,11 @@ function setCameraDistance(distance: number): void {
   camera.position.z = distance;
 }
 
-function setBoundsSize(size: number): void {
-  bounds.scale.setScalar(size / 2);
+function setBoundsSize(width: number, height: number): void {
+  bounds.scale.set(width / 2, height / 2, 1);
 }
 
 setCameraDistance(config.cameraDistance);
-setBoundsSize(config.boundsSize);
+setBoundsSize(config.boundsWidth, config.boundsHeight);
 
 export { scene, renderer, camera, particle, setCameraDistance, setBoundsSize };

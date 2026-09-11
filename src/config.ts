@@ -19,7 +19,8 @@ const config = {
   particleSize: 0.1,
   particleSpacing: 0,
 
-  boundsSize: 16,
+  boundsWidth: 16,
+  boundsHeight: 9,
   cameraDistance: 15,
 };
 
@@ -28,10 +29,13 @@ simulationFolder.add(config, "paused");
 simulationFolder.add(config, "gravity", -20, 20);
 simulationFolder.add(config, "collisionDamping", 0, 1);
 simulationFolder
-  .add(config, "boundsSize", 5, 30)
-  .onChange((size: number) => setBoundsSize(size));
+  .add(config, "boundsWidth", 5, 30)
+  .onChange(() => setBoundsSize(config.boundsWidth, config.boundsHeight));
+simulationFolder
+  .add(config, "boundsHeight", 5, 30)
+  .onChange(() => setBoundsSize(config.boundsWidth, config.boundsHeight));
 simulationFolder.add(config, "targetDensity", 0.5, 5);
-simulationFolder.add(config, "pressureMultiplier", 0, 2);
+simulationFolder.add(config, "pressureMultiplier", 0, 20);
 
 const particleFolder = gui.addFolder("Particles");
 particleFolder.add(config, "numParticles", 1, 4000, 1).onChange(() => start());

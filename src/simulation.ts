@@ -104,8 +104,9 @@ function calculatePressureForce(particleIndex: number): THREE.Vector2 {
 }
 
 function getHalfBounds(): THREE.Vector2 {
-  return new THREE.Vector2().setScalar(
-    config.boundsSize / 2 - config.particleSize,
+  return new THREE.Vector2(
+    config.boundsWidth / 2 - config.particleSize,
+    config.boundsHeight / 2 - config.particleSize,
   );
 }
 
