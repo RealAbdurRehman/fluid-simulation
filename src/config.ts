@@ -10,7 +10,7 @@ const config = {
   paused: true,
 
   gravity: 0,
-  collisionDamping: 0.5,
+  collisionDamping: 0.1,
 
   targetDensity: 1.5,
   pressureMultiplier: 100,
