@@ -4,7 +4,7 @@ import { scene, camera, renderer } from "./scene";
 import { update, start } from "./simulation";
 
 let accumulator = 0;
-const FIXED_DELTA = 1 / 60;
+const FIXED_DELTA = 1 / 120;
 const MAX_FRAME_DELTA = 0.1;
 
 const time = new THREE.Timer();
