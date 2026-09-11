@@ -1,7 +1,5 @@
 import * as THREE from "three";
 
-import { config } from "./config";
-
 const app = document.getElementById("app")!;
 
 const scene = new THREE.Scene();
@@ -49,11 +47,6 @@ const boundsMaterial = new THREE.LineBasicMaterial({
 const bounds = new THREE.Line(boundsGeometry, boundsMaterial);
 scene.add(bounds);
 
-const particle = new THREE.Mesh(
-  new THREE.CircleGeometry(),
-  new THREE.MeshBasicMaterial({ color: 0x0278fd }),
-);
-
 function setCameraDistance(distance: number): void {
   camera.position.z = distance;
 }
@@ -62,7 +55,4 @@ function setBoundsSize(width: number, height: number): void {
   bounds.scale.set(width / 2, height / 2, 1);
 }
 
-setCameraDistance(config.cameraDistance);
-setBoundsSize(config.boundsWidth, config.boundsHeight);
-
-export { scene, renderer, camera, particle, setCameraDistance, setBoundsSize };
+export { scene, renderer, camera, setCameraDistance, setBoundsSize };

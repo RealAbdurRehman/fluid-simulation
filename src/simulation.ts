@@ -1,7 +1,7 @@
 import * as THREE from "three";
 
 import { config } from "./config";
-import { scene, particle } from "./scene";
+import * as particles from "./particles";
 
 const DOWN: THREE.Vector2 = new THREE.Vector2(0, -1);
 
@@ -11,7 +11,6 @@ const velocities: THREE.Vector2[] = [];
 
 const particleMass = 1;
 
-const particles: THREE.Mesh[] = [];
 const densities: number[] = [];
 
 class Entry {
@@ -208,14 +207,10 @@ function setParticleGridPosition(): void {
     y = THREE.MathUtils.clamp(y, -halfBounds.y, halfBounds.y);
 
     positions[i].set(x, y);
-    particles[i].position.set(x, y);
   }
 }
 
 function clearParticles(): void {
-  for (const particle of particles) scene.remove(particle);
-
-  particles.length = 0;
   positions.length = 0;
   predictedPositions.length = 0;
   velocities.length = 0;
@@ -230,14 +225,9 @@ function start(): void {
     velocities.push(new THREE.Vector2());
     positions.push(new THREE.Vector2());
     predictedPositions.push(new THREE.Vector2());
-
-    const particleInstance = particle.clone();
-    particleInstance.scale.setScalar(config.particleSize);
-    particles.push(particleInstance);
-
-    scene.add(particleInstance);
   }
 
+  particles.setParticleCount(config.numParticles);
   setParticleGridPosition();
 }
 
@@ -266,12 +256,21 @@ function update(delta: number): void {
   for (let i = 0; i < config.numParticles; i++) {
     positions[i].addScaledVector(velocities[i], delta);
     resolveCollisions(positions[i], velocities[i]);
-    particles[i].position.set(positions[i].x, positions[i].y);
   }
 }
 
-function setParticleSize(size: number): void {
-  for (const particle of particles) particle.scale.setScalar(size);
+function syncVisuals(): void {
+  for (let i = 0; i < config.numParticles; i++) {
+    const p = positions[i];
+    const speed = velocities[i].length();
+    particles.updateParticle(i, p.x, p.y, speed);
+  }
+
+  particles.commitParticles();
 }
 
-export { update, start, setParticleSize, setParticleGridPosition };
+function setParticleSize(size: number): void {
+  particles.setParticleSize(size);
+}
+
+export { update, start, syncVisuals, setParticleSize, setParticleGridPosition };

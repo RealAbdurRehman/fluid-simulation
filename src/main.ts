@@ -1,7 +1,7 @@
 import * as THREE from "three";
 
 import { scene, camera, renderer } from "./scene";
-import { update, start } from "./simulation";
+import { update, start, syncVisuals } from "./simulation";
 
 let accumulator = 0;
 const FIXED_DELTA = 1 / 60;
@@ -21,6 +21,8 @@ function animate(timestamp: number): void {
     update(FIXED_DELTA);
     accumulator -= FIXED_DELTA;
   }
+
+  syncVisuals();
 
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
