@@ -15,6 +15,7 @@ const config = {
   targetDensity: 1.5,
   pressureMultiplier: 100,
   smoothingRadius: 0.4,
+  viscosityStrength: 5,
   interactionRadius: 4,
   interactionStrength: 50,
 
@@ -58,6 +59,7 @@ particleFolder
     setParticleGridPosition();
   });
 particleFolder.add(config, "smoothingRadius", 0.1, 1);
+particleFolder.add(config, "viscosityStrength", 0.1, 10);
 particleFolder.add(config, "interactionRadius", 0.1, 10);
 particleFolder.add(config, "interactionStrength", 0.1, 100);
 

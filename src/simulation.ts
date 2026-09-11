@@ -105,6 +105,34 @@ function calculatePressureForce(particleIndex: number): THREE.Vector2 {
   return pressureForce;
 }
 
+function viscositySmoothingKernel(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
+  return ((radius - distance) * (radius - distance)) / volume;
+}
+
+function calculateViscosityForce(particleIndex: number): THREE.Vector2 {
+  const viscosityForce = new THREE.Vector2();
+  const position = predictedPositions[particleIndex];
+  foreachPointWithinRadius(position, (neighborIndex) => {
+    const distance = position
+      .clone()
+      .sub(predictedPositions[neighborIndex])
+      .length();
+    const influence = viscositySmoothingKernel(
+      config.smoothingRadius,
+      distance,
+    );
+    viscosityForce.addScaledVector(
+      velocities[neighborIndex].clone().sub(velocities[particleIndex]),
+      influence,
+    );
+  });
+
+  return viscosityForce.multiplyScalar(config.viscosityStrength);
+}
+
 function getHalfBounds(): THREE.Vector2 {
   return new THREE.Vector2(
     config.boundsWidth / 2 - config.particleSize,
@@ -292,6 +320,10 @@ function update(delta: number): void {
     const pressureForce = calculatePressureForce(i);
     const pressureAcceleration = pressureForce.divideScalar(density);
     velocities[i].addScaledVector(pressureAcceleration, delta);
+
+    const viscosityForce = calculateViscosityForce(i);
+    const viscosityAcceleration = viscosityForce.divideScalar(density);
+    velocities[i].addScaledVector(viscosityAcceleration, delta);
   }
 
   for (let i = 0; i < config.numParticles; i++) {
