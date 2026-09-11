@@ -9,7 +9,7 @@ const gui = new GUI();
 const config = {
   paused: true,
 
-  gravity: 0,
+  gravity: 9.81,
   collisionDamping: 0.1,
 
   targetDensity: 1.5,
@@ -23,8 +23,8 @@ const config = {
   particleSize: 0.1,
   particleSpacing: 0,
 
-  boundsWidth: 16,
-  boundsHeight: 9,
+  boundsWidth: 28,
+  boundsHeight: 14,
   cameraDistance: 15,
 
   minSpeed: 0,
