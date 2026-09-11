@@ -15,6 +15,8 @@ const config = {
   targetDensity: 1.5,
   pressureMultiplier: 0.1,
   smoothingRadius: 0.4,
+  interactionRadius: 4,
+  interactionStrength: 50,
 
   numParticles: 1000,
   maxParticles: MAX_PARTICLES,
@@ -56,6 +58,8 @@ particleFolder
     setParticleGridPosition();
   });
 particleFolder.add(config, "smoothingRadius", 0.1, 1);
+particleFolder.add(config, "interactionRadius", 0.1, 10);
+particleFolder.add(config, "interactionStrength", 0.1, 100);
 
 const visualsFolder = gui.addFolder("Visuals");
 visualsFolder

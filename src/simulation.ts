@@ -25,6 +25,9 @@ class Entry {
 const spatialLookup: Entry[] = [];
 const startIndices: number[] = [];
 
+let interactionStrength = 0;
+const interactionPosition = new THREE.Vector2();
+
 const cellOffsets: [number, number][] = [];
 for (let y = -1; y <= 1; y++)
   for (let x = -1; x <= 1; x++) cellOffsets.push([x, y]);
@@ -189,6 +192,32 @@ function foreachPointWithinRadius(
   }
 }
 
+function interactionForce(
+  inputPos: THREE.Vector2,
+  radius: number,
+  strength: number,
+  particleIndex: number,
+): THREE.Vector2 {
+  const interactionForce = new THREE.Vector2();
+  const offset = inputPos.clone().sub(positions[particleIndex]);
+  const distanceSqr = offset.dot(offset);
+
+  if (distanceSqr < radius * radius) {
+    const distance = Math.sqrt(distanceSqr);
+    const directionToInputPoint =
+      distance <= 0 ? new THREE.Vector2() : offset.divideScalar(distance);
+    const centerT = 1 - distance / radius;
+    interactionForce.addScaledVector(
+      directionToInputPoint
+        .multiplyScalar(strength)
+        .sub(velocities[particleIndex]),
+      centerT,
+    );
+  }
+
+  return interactionForce;
+}
+
 function setParticleGridPosition(): void {
   const numParticles = config.numParticles;
   const particlesPerRow = Math.floor(Math.sqrt(numParticles));
@@ -236,6 +265,18 @@ function update(delta: number): void {
 
   for (let i = 0; i < config.numParticles; i++) {
     velocities[i].addScaledVector(DOWN, config.gravity * delta);
+
+    if (interactionStrength !== 0)
+      velocities[i].addScaledVector(
+        interactionForce(
+          interactionPosition,
+          config.interactionRadius,
+          interactionStrength,
+          i,
+        ),
+        delta,
+      );
+
     predictedPositions[i]
       .copy(positions[i])
       .addScaledVector(velocities[i], delta);
@@ -273,4 +314,16 @@ function setParticleSize(size: number): void {
   particles.setParticleSize(size);
 }
 
-export { update, start, syncVisuals, setParticleSize, setParticleGridPosition };
+function setInteraction(position: THREE.Vector2, strength: number): void {
+  interactionPosition.copy(position);
+  interactionStrength = strength;
+}
+
+export {
+  update,
+  start,
+  syncVisuals,
+  setParticleSize,
+  setParticleGridPosition,
+  setInteraction,
+};
