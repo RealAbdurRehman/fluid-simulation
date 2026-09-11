@@ -13,7 +13,7 @@ const config = {
   collisionDamping: 0.5,
 
   targetDensity: 1.5,
-  pressureMultiplier: 0.1,
+  pressureMultiplier: 100,
   smoothingRadius: 0.4,
   interactionRadius: 4,
   interactionStrength: 50,
@@ -42,7 +42,7 @@ simulationFolder
   .add(config, "boundsHeight", 5, 30)
   .onChange(() => setBoundsSize(config.boundsWidth, config.boundsHeight));
 simulationFolder.add(config, "targetDensity", 0.5, 5);
-simulationFolder.add(config, "pressureMultiplier", 0, 20);
+simulationFolder.add(config, "pressureMultiplier", 0, 100);
 
 const particleFolder = gui.addFolder("Particles");
 particleFolder
