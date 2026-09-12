@@ -18,7 +18,7 @@ const config = {
   smoothingRadius: 0.8,
   viscosityStrength: 3,
   interactionRadius: 4,
-  interactionStrength: 50,
+  interactionStrength: 30,
 
   numParticles: 1000,
   maxParticles: MAX_PARTICLES,
