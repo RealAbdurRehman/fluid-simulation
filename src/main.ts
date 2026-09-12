@@ -1,75 +1,142 @@
 import * as THREE from "three";
+import { config, setupGUI } from "./config";
+import {
+  scene,
+  camera,
+  renderer,
+  setCameraDistance,
+  setBoundsSize,
+} from "./scene";
+import { FluidSimulationGPU } from "./simulation";
+import { GPUParticleRenderer } from "./renderer";
 
-import { config } from "./config";
-import { scene, camera, renderer } from "./scene";
-import { update, start, syncVisuals, setInteraction } from "./simulation";
+async function bootstrap() {
+  const gpuCanvas = document.createElement("canvas");
+  gpuCanvas.width = window.innerWidth * window.devicePixelRatio;
+  gpuCanvas.height = window.innerHeight * window.devicePixelRatio;
+  gpuCanvas.style.position = "absolute";
+  gpuCanvas.style.top = "0";
+  gpuCanvas.style.left = "0";
+  gpuCanvas.style.width = "100vw";
+  gpuCanvas.style.height = "100vh";
+  gpuCanvas.style.pointerEvents = "none";
+  document.getElementById("app")!.appendChild(gpuCanvas);
 
-let accumulator = 0;
-const FIXED_DELTA = 1 / 60;
-const MAX_FRAME_DELTA = 0.1;
+  const simulation = new FluidSimulationGPU();
+  const initialized = await simulation.initialize();
+  if (!initialized) return;
 
-const time = new THREE.Timer();
+  const gpuRenderer = new GPUParticleRenderer(
+    simulation.getDevice(),
+    gpuCanvas,
+    simulation.getParticlesBuffer(),
+  );
 
-let interactionButton: number | null = null;
+  const viewProj = new THREE.Matrix4();
+  const viewProjArray = new Float32Array(16);
 
-const mouse = new THREE.Vector2();
-const raycaster = new THREE.Raycaster();
-const simulationPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-const mouseWorld3D = new THREE.Vector3();
-const mouseWorld = new THREE.Vector2();
+  setupGUI(
+    () => simulation.updateParticleCount(),
+    () => setBoundsSize(config.boundsWidth, config.boundsHeight),
+    (dist: number) => setCameraDistance(dist),
+    () => {},
+  );
 
-function updateMousePosition(event: PointerEvent): void {
-  const rect = renderer.domElement.getBoundingClientRect();
-  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  setBoundsSize(config.boundsWidth, config.boundsHeight);
+  setCameraDistance(config.cameraDistance);
 
-  raycaster.setFromCamera(mouse, camera);
-  raycaster.ray.intersectPlane(simulationPlane, mouseWorld3D);
-  mouseWorld.set(mouseWorld3D.x, mouseWorld3D.y);
-}
+  window.addEventListener("resize", () => {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio, 2);
 
-start();
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(dpr);
 
-function animate(timestamp: number): void {
-  time.update(timestamp);
+    gpuCanvas.width = width * dpr;
+    gpuCanvas.height = height * dpr;
 
-  const delta = Math.min(time.getDelta(), MAX_FRAME_DELTA);
-  accumulator += delta;
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+  });
 
-  while (accumulator >= FIXED_DELTA) {
-    update(FIXED_DELTA);
-    accumulator -= FIXED_DELTA;
+  let mouseButton: number | null = null;
+  const mouse = new THREE.Vector2();
+  const raycaster = new THREE.Raycaster();
+  const simulationPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  const mouseWorld3D = new THREE.Vector3();
+  const mouseWorld = new THREE.Vector2();
+
+  function updatePointer(e: PointerEvent) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    raycaster.ray.intersectPlane(simulationPlane, mouseWorld3D);
+    mouseWorld.set(mouseWorld3D.x, mouseWorld3D.y);
   }
 
-  syncVisuals();
+  window.addEventListener("contextmenu", (e) => e.preventDefault());
 
-  renderer.render(scene, camera);
+  window.addEventListener("pointerdown", (e) => {
+    mouseButton = e.button;
+    updatePointer(e);
+    if (mouseButton === 0)
+      simulation.setInteraction(mouseWorld, -config.interactionStrength);
+    if (mouseButton === 2)
+      simulation.setInteraction(mouseWorld, config.interactionStrength);
+  });
+
+  window.addEventListener("pointermove", (e) => {
+    updatePointer(e);
+    if (mouseButton === 0)
+      simulation.setInteraction(mouseWorld, -config.interactionStrength);
+    if (mouseButton === 2)
+      simulation.setInteraction(mouseWorld, config.interactionStrength);
+  });
+
+  window.addEventListener("pointerup", () => {
+    mouseButton = null;
+    simulation.setInteraction(mouseWorld, 0);
+  });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") config.paused = !config.paused;
+    if (e.code === "KeyR") simulation.initParticleGrid();
+  });
+
+  const timer = new THREE.Timer();
+  const FIXED_DELTA = 1 / 60;
+  let accumulator = 0;
+
+  function animate(timestamp: number) {
+    timer.update(timestamp);
+    accumulator += Math.min(timer.getDelta(), 0.1);
+
+    camera.updateMatrixWorld();
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    viewProj.multiplyMatrices(
+      camera.projectionMatrix,
+      camera.matrixWorldInverse,
+    );
+    viewProj.toArray(viewProjArray);
+
+    const commandEncoder = simulation.getDevice().createCommandEncoder();
+    while (accumulator >= FIXED_DELTA) {
+      simulation.recordStepCommands(commandEncoder, FIXED_DELTA);
+      accumulator -= FIXED_DELTA;
+    }
+
+    renderer.render(scene, camera);
+
+    gpuRenderer.render(commandEncoder, viewProjArray, config.numParticles);
+    simulation.getDevice().queue.submit([commandEncoder.finish()]);
+
+    requestAnimationFrame(animate);
+  }
+
   requestAnimationFrame(animate);
 }
 
-requestAnimationFrame(animate);
-
-window.addEventListener("contextmenu", (event) => event.preventDefault());
-
-window.addEventListener("pointermove", (event) => {
-  updateMousePosition(event);
-  if (interactionButton === 0)
-    setInteraction(mouseWorld, -config.interactionStrength);
-  else if (interactionButton === 2)
-    setInteraction(mouseWorld, config.interactionStrength);
-});
-
-window.addEventListener("pointerdown", (event) => {
-  interactionButton = event.button;
-  updateMousePosition(event);
-
-  if (event.button === 0)
-    setInteraction(mouseWorld, -config.interactionStrength);
-  else if (event.button === 2)
-    setInteraction(mouseWorld, config.interactionStrength);
-});
-
-window.addEventListener("pointerup", () => {
-  interactionButton = null;
-  setInteraction(mouseWorld, 0);
-});
+bootstrap();

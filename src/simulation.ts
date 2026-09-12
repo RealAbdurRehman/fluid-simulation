@@ -1,409 +1,491 @@
 import * as THREE from "three";
 
 import { config } from "./config";
-import * as particles from "./particles";
+import { fluidComputeShaderWGSL } from "./shader/fluidCompute.wgsl";
+import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
 
-const DOWN: THREE.Vector2 = new THREE.Vector2(0, -1);
-
-const halfBounds = new THREE.Vector2();
-
-const positions: THREE.Vector2[] = [];
-const predictedPositions: THREE.Vector2[] = [];
-const velocities: THREE.Vector2[] = [];
-
-const particleMass = 1;
-
-const densities: number[] = [];
-const nearDensities: number[] = [];
-
-class Entry {
-  index: number;
-  key: number;
-  constructor(index: number, key: number) {
-    this.index = index;
-    this.key = key;
-  }
+interface BitonicStep {
+  k: number;
+  j: number;
 }
 
-const spatialLookup: Entry[] = [];
-const startIndices: number[] = [];
+export class FluidSimulationGPU {
+  private device!: GPUDevice;
+  private isInitialized = false;
 
-let interactionStrength = 0;
-const interactionPosition = new THREE.Vector2();
+  private maxPaddedCount = 0;
+  private paddedParticlesCount = 0;
+  private bitonicSteps: BitonicStep[] = [];
+  private uniformAlignment = 256;
 
-const cellOffsets: [number, number][] = [];
-for (let y = -1; y <= 1; y++)
-  for (let x = -1; x <= 1; x++) cellOffsets.push([x, y]);
+  private particlesBuffer!: GPUBuffer;
+  private spatialLookupBuffer!: GPUBuffer;
+  private startIndicesBuffer!: GPUBuffer;
+  private simParamsBuffer!: GPUBuffer;
+  private bitonicParamsBuffer!: GPUBuffer;
+  private stagingBuffer!: GPUBuffer;
 
-function positionToCellCoord(
-  point: THREE.Vector2,
-  radius: number,
-): [number, number] {
-  const cellX = Math.floor(point.x / radius);
-  const cellY = Math.floor(point.y / radius);
-  return [cellX, cellY];
-}
+  private externalForcesPipeline!: GPUComputePipeline;
+  private updateSpatialHashPipeline!: GPUComputePipeline;
+  private bitonicSortPipeline!: GPUComputePipeline;
+  private clearStartIndicesPipeline!: GPUComputePipeline;
+  private calculateStartIndicesPipeline!: GPUComputePipeline;
+  private calculateDensitiesPipeline!: GPUComputePipeline;
+  private calculateForcesPipeline!: GPUComputePipeline;
+  private integratePositionsPipeline!: GPUComputePipeline;
 
-function hashCell(cellX: number, cellY: number): number {
-  const a = (cellX >>> 0) * 15823;
-  const b = (cellY >>> 0) * 9737333;
-  return (a + b) >>> 0;
-}
+  private mainBindGroup!: GPUBindGroup;
+  private bitonicBindGroup!: GPUBindGroup;
+  private bitonicBindGroupLayout!: GPUBindGroupLayout;
 
-function getKeyFromHash(hash: number, tableSize: number): number {
-  return hash % tableSize;
-}
+  private isMapping = false;
+  private cachedParticleData = new Float32Array(0);
 
-function foreachPointWithinRadius(
-  point: THREE.Vector2,
-  callback: (particleIndex: number) => void,
-): void {
-  const radius = config.smoothingRadius;
-  const [centerX, centerY] = positionToCellCoord(point, radius);
-  const radiusSqr = radius * radius;
+  private interactionPosition = new THREE.Vector2();
+  private interactionStrength = 0;
+  public async initialize(): Promise<boolean> {
+    if (!navigator.gpu) {
+      console.error("WebGPU is not supported by your browser/device.");
+      return false;
+    }
 
-  for (const [offsetX, offsetY] of cellOffsets) {
-    const key = getKeyFromHash(
-      hashCell(centerX + offsetX, centerY + offsetY),
-      spatialLookup.length,
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance",
+    });
+    if (!adapter) {
+      console.error("Failed to acquire high-performance WebGPU adapter.");
+      return false;
+    }
+
+    this.device = await adapter.requestDevice();
+    this.uniformAlignment = Math.max(
+      256,
+      this.device.limits.minUniformBufferOffsetAlignment || 256,
     );
-    const cellStartIndex = startIndices[key];
 
-    for (let i = cellStartIndex; i < spatialLookup.length; i++) {
-      if (spatialLookup[i].key !== key) break;
-
-      const particleIndex = spatialLookup[i].index;
-      const dx = predictedPositions[particleIndex].x - point.x;
-      const dy = predictedPositions[particleIndex].y - point.y;
-
-      const distanceSqr = dx * dx + dy * dy;
-      if (distanceSqr <= radiusSqr) callback(particleIndex);
-    }
+    this.createPipelines();
+    this.allocateFixedBuffers();
+    this.updateParticleCount();
+    this.isInitialized = true;
+    return true;
   }
-}
-
-function smoothingKernel(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
-  return ((radius - distance) * (radius - distance)) / volume;
-}
-
-function smoothingKernelDerivative(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const scale = 12 / (Math.PI * Math.pow(radius, 4));
-  return (distance - radius) * scale;
-}
-
-function nearSmoothingKernel(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const volume = (Math.PI * Math.pow(radius, 5)) / 10;
-  return Math.pow(radius - distance, 3) / volume;
-}
-
-function nearSmoothingKernelDerivative(
-  radius: number,
-  distance: number,
-): number {
-  if (distance >= radius) return 0;
-
-  const scale = 30 / (Math.PI * Math.pow(radius, 5));
-  return -(radius - distance) * (radius - distance) * scale;
-}
-
-function calculateDensity(point: THREE.Vector2): [number, number] {
-  let density = 0;
-  let nearDensity = 0;
-  foreachPointWithinRadius(point, (particleIndex) => {
-    const distance = predictedPositions[particleIndex].distanceTo(point);
-    density += particleMass * smoothingKernel(config.smoothingRadius, distance);
-    nearDensity +=
-      particleMass * nearSmoothingKernel(config.smoothingRadius, distance);
-  });
-
-  return [density, nearDensity];
-}
-
-function updateDensities(): void {
-  for (let i = 0; i < config.numParticles; i++) {
-    const [density, nearDensity] = calculateDensity(predictedPositions[i]);
-    densities[i] = density;
-    nearDensities[i] = nearDensity;
+  private nextPowerOfTwo(n: number): number {
+    return Math.pow(2, Math.ceil(Math.log2(Math.max(n, 2))));
   }
-}
+  private createPipelines(): void {
+    const shaderModule = this.device.createShaderModule({
+      code: fluidComputeShaderWGSL,
+    });
 
-function convertDensityToPressure(density: number): number {
-  const densityError = density - config.targetDensity;
-  return densityError * config.pressureMultiplier;
-}
+    const mainBindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+      ],
+    });
 
-function convertNearDensityToPressure(nearDensity: number): number {
-  return nearDensity * config.nearDensityMultiplier;
-}
+    this.bitonicBindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: {
+            type: "uniform",
+            hasDynamicOffset: true,
+            minBindingSize: 16,
+          },
+        },
+      ],
+    });
 
-function calculateSharedPressure(densityA: number, densityB: number): number {
-  return (
-    (convertDensityToPressure(densityA) + convertDensityToPressure(densityB)) /
-    2
-  );
-}
+    const mainPipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [mainBindGroupLayout],
+    });
 
-function calculateSharedNearPressure(
-  nearDensityA: number,
-  nearDensityB: number,
-): number {
-  return (
-    (convertNearDensityToPressure(nearDensityA) +
-      convertNearDensityToPressure(nearDensityB)) /
-    2
-  );
-}
+    const bitonicPipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [mainBindGroupLayout, this.bitonicBindGroupLayout],
+    });
 
-function viscositySmoothingKernel(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
+    this.externalForcesPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "externalForces" },
+    });
+    this.updateSpatialHashPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "updateSpatialHash" },
+    });
+    this.bitonicSortPipeline = this.device.createComputePipeline({
+      layout: bitonicPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "bitonicSort" },
+    });
+    this.clearStartIndicesPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "clearStartIndices" },
+    });
+    this.calculateStartIndicesPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "calculateStartIndices" },
+    });
+    this.calculateDensitiesPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "calculateDensities" },
+    });
+    this.calculateForcesPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "calculateForces" },
+    });
+    this.integratePositionsPipeline = this.device.createComputePipeline({
+      layout: mainPipelineLayout,
+      compute: { module: shaderModule, entryPoint: "integratePositions" },
+    });
+  }
+  private allocateFixedBuffers(): void {
+    this.maxPaddedCount = this.nextPowerOfTwo(config.maxParticles);
+    const particleByteSize = 32;
 
-  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
-  return ((radius - distance) * (radius - distance)) / volume;
-}
+    this.particlesBuffer = this.device.createBuffer({
+      size: this.maxPaddedCount * particleByteSize,
+      usage:
+        GPUBufferUsage.STORAGE |
+        GPUBufferUsage.COPY_DST |
+        GPUBufferUsage.COPY_SRC,
+    });
 
-function calculatePressureAndViscosityForces(
-  particleIndex: number,
-): THREE.Vector2 {
-  const totalForce = new THREE.Vector2();
-  const point = predictedPositions[particleIndex];
-  const density = densities[particleIndex];
-  const nearDensity = nearDensities[particleIndex];
-  const velocity = velocities[particleIndex];
+    this.spatialLookupBuffer = this.device.createBuffer({
+      size: this.maxPaddedCount * 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
-  foreachPointWithinRadius(point, (neighborIndex) => {
-    if (neighborIndex === particleIndex) return;
-    const neighbor = predictedPositions[neighborIndex];
+    this.startIndicesBuffer = this.device.createBuffer({
+      size: this.maxPaddedCount * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
-    const dx = neighbor.x - point.x;
-    const dy = neighbor.y - point.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    if (distance === 0) return;
+    this.simParamsBuffer = this.device.createBuffer({
+      size: 112,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
-    const dirX = dx / distance;
-    const dirY = dy / distance;
-
-    const neighborDensity = densities[neighborIndex];
-    const neighborNearDensity = nearDensities[neighborIndex];
-
-    if (neighborDensity > 0) {
-      const slope = smoothingKernelDerivative(config.smoothingRadius, distance);
-      const sharedPressure = calculateSharedPressure(neighborDensity, density);
-      const scalar = (sharedPressure * slope * particleMass) / neighborDensity;
-      totalForce.x += dirX * scalar;
-      totalForce.y += dirY * scalar;
-    }
-
-    if (neighborNearDensity > 0) {
-      const nearSlope = nearSmoothingKernelDerivative(
-        config.smoothingRadius,
-        distance,
-      );
-      const sharedNearPressure = calculateSharedNearPressure(
-        neighborNearDensity,
-        nearDensity,
-      );
-      const nearScalar =
-        (sharedNearPressure * nearSlope * particleMass) / neighborNearDensity;
-      totalForce.x += dirX * nearScalar;
-      totalForce.y += dirY * nearScalar;
-    }
-
-    const influence = viscositySmoothingKernel(
-      config.smoothingRadius,
-      distance,
+    const maxBitonicPasses =
+      (Math.log2(this.maxPaddedCount) * (Math.log2(this.maxPaddedCount) + 1)) /
+      2;
+    const totalBitonicBytes = Math.max(
+      256,
+      maxBitonicPasses * this.uniformAlignment,
     );
-    const neighborVel = velocities[neighborIndex];
-    const scalarVisc = influence * config.viscosityStrength;
-    totalForce.x += (neighborVel.x - velocity.x) * scalarVisc;
-    totalForce.y += (neighborVel.y - velocity.y) * scalarVisc;
-  });
 
-  return totalForce;
-}
+    this.bitonicParamsBuffer = this.device.createBuffer({
+      size: totalBitonicBytes,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
-function updateHalfBounds(): void {
-  halfBounds.set(
-    config.boundsWidth / 2 - config.particleSize,
-    config.boundsHeight / 2 - config.particleSize,
-  );
-}
+    this.stagingBuffer = this.device.createBuffer({
+      size: this.maxPaddedCount * particleByteSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
 
-function resolveCollisions(
-  position: THREE.Vector2,
-  velocity: THREE.Vector2,
-): void {
-  if (Math.abs(position.x) > halfBounds.x) {
-    position.x = halfBounds.x * Math.sign(position.x);
-    velocity.x *= -1 * config.collisionDamping;
+    this.cachedParticleData = new Float32Array(this.maxPaddedCount * 8);
+
+    this.mainBindGroup = this.device.createBindGroup({
+      layout: this.externalForcesPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.simParamsBuffer } },
+        { binding: 1, resource: { buffer: this.particlesBuffer } },
+        { binding: 2, resource: { buffer: this.spatialLookupBuffer } },
+        { binding: 3, resource: { buffer: this.startIndicesBuffer } },
+      ],
+    });
+
+    this.bitonicBindGroup = this.device.createBindGroup({
+      layout: this.bitonicBindGroupLayout,
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: this.bitonicParamsBuffer,
+            offset: 0,
+            size: 16,
+          },
+        },
+      ],
+    });
   }
-  if (Math.abs(position.y) > halfBounds.y) {
-    position.y = halfBounds.y * Math.sign(position.y);
-    velocity.y *= -1 * config.collisionDamping;
+  public updateParticleCount(): void {
+    this.paddedParticlesCount = this.nextPowerOfTwo(config.numParticles);
+
+    this.bitonicSteps = [];
+    for (let k = 2; k <= this.paddedParticlesCount; k <<= 1)
+      for (let j = k >> 1; j > 0; j >>= 1) this.bitonicSteps.push({ k, j });
+
+    const bitonicDataArray = new Uint32Array(
+      (this.bitonicSteps.length * this.uniformAlignment) / 4,
+    );
+    for (let s = 0; s < this.bitonicSteps.length; s++) {
+      const u32Offset = (s * this.uniformAlignment) / 4;
+      bitonicDataArray[u32Offset + 0] = this.bitonicSteps[s].k;
+      bitonicDataArray[u32Offset + 1] = this.bitonicSteps[s].j;
+      bitonicDataArray[u32Offset + 2] = this.paddedParticlesCount;
+      bitonicDataArray[u32Offset + 3] = 0;
+    }
+    this.device.queue.writeBuffer(
+      this.bitonicParamsBuffer,
+      0,
+      bitonicDataArray,
+    );
+
+    this.initParticleGrid();
   }
-}
+  public initParticleGrid(): void {
+    const numParticles = config.numParticles;
+    const initialData = new Float32Array(this.paddedParticlesCount * 8);
 
-function updateSpatialLookup(points: THREE.Vector2[], radius: number): void {
-  for (let i = 0; i < points.length; i++) {
-    const [cellX, cellY] = positionToCellCoord(points[i], radius);
-    const cellKey = getKeyFromHash(hashCell(cellX, cellY), points.length);
+    const halfBoundX = config.boundsWidth / 2 - config.particleSize * 1.5;
+    const halfBoundY = config.boundsHeight / 2 - config.particleSize * 1.5;
 
-    if (spatialLookup[i]) {
-      spatialLookup[i].index = i;
-      spatialLookup[i].key = cellKey;
-    } else spatialLookup[i] = new Entry(i, cellKey);
+    const availableWidth = halfBoundX * 2;
+    const availableHeight = halfBoundY * 2;
 
-    startIndices[i] = Number.MAX_SAFE_INTEGER;
+    const aspectRatio = Math.max(0.1, availableWidth / availableHeight);
+    let particlesPerRow = Math.max(
+      1,
+      Math.round(Math.sqrt(numParticles * aspectRatio)),
+    );
+    let particlesPerCol = Math.ceil(numParticles / particlesPerRow);
+
+    const maxSpacingX = availableWidth / Math.max(1, particlesPerRow);
+    const maxSpacingY = availableHeight / Math.max(1, particlesPerCol);
+    const spacing = Math.min(
+      config.particleSize * 2 + config.particleSpacing,
+      Math.min(maxSpacingX, maxSpacingY) * 0.95,
+    );
+
+    const startX = -((particlesPerRow - 1) * spacing) / 2;
+    const startY = -((particlesPerCol - 1) * spacing) / 2;
+
+    for (let i = 0; i < numParticles; i++) {
+      const col = i % particlesPerRow;
+      const row = Math.floor(i / particlesPerRow);
+
+      let x = startX + col * spacing;
+      let y = startY + row * spacing;
+
+      x = THREE.MathUtils.clamp(x, -halfBoundX, halfBoundX);
+      y = THREE.MathUtils.clamp(y, -halfBoundY, halfBoundY);
+
+      const offset = i * 8;
+      initialData[offset + 0] = x;
+      initialData[offset + 1] = y;
+      initialData[offset + 2] = x;
+      initialData[offset + 3] = y;
+      initialData[offset + 4] = 0;
+      initialData[offset + 5] = 0;
+      initialData[offset + 6] = 0;
+      initialData[offset + 7] = 0;
+    }
+
+    this.device.queue.writeBuffer(this.particlesBuffer, 0, initialData);
   }
+  public updateUniforms(subDelta: number): void {
+    const r = config.smoothingRadius;
+    const r4 = Math.pow(r, 4);
+    const r5 = Math.pow(r, 5);
 
-  spatialLookup.sort((a, b) => a.key - b.key);
+    const poly6Factor = 6 / (Math.PI * r4);
+    const spikyGradFactor = 12 / (Math.PI * r4);
+    const nearSpikyGradFactor = 30 / (Math.PI * r5);
+    const viscFactor = 6 / (Math.PI * r4);
 
-  for (let i = 0; i < points.length; i++) {
-    const key = spatialLookup[i].key;
-    const keyPrev =
-      i === 0 ? Number.MAX_SAFE_INTEGER : spatialLookup[i - 1].key;
-    if (key !== keyPrev) startIndices[key] = i;
+    const buffer = new ArrayBuffer(112);
+    const f32 = new Float32Array(buffer);
+    const u32 = new Uint32Array(buffer);
+
+    f32[0] = config.boundsWidth;
+    f32[1] = config.boundsHeight;
+    f32[2] = config.gravity;
+    f32[3] = config.collisionDamping;
+
+    f32[4] = config.targetDensity;
+    f32[5] = config.pressureMultiplier;
+    f32[6] = config.nearDensityMultiplier;
+    f32[7] = config.viscosityStrength;
+
+    f32[8] = config.smoothingRadius;
+    f32[9] = 1.0;
+    f32[10] = config.particleSize;
+    f32[11] = subDelta;
+
+    u32[12] = config.numParticles;
+    u32[13] = this.paddedParticlesCount;
+    f32[14] = config.interactionRadius;
+    f32[15] = this.interactionStrength;
+
+    f32[16] = this.interactionPosition.x;
+    f32[17] = this.interactionPosition.y;
+    f32[18] = poly6Factor;
+    f32[19] = spikyGradFactor;
+
+    f32[20] = nearSpikyGradFactor;
+    f32[21] = viscFactor;
+    f32[22] = 0;
+    f32[23] = 0;
+
+    this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }
-}
+  public step(deltaTime: number): void {
+    if (!this.isInitialized || config.paused) return;
 
-function applyInteractionForce(
-  inputPos: THREE.Vector2,
-  radius: number,
-  strength: number,
-  particleIndex: number,
-  delta: number,
-): void {
-  const px = positions[particleIndex].x;
-  const py = positions[particleIndex].y;
-  const offsetX = inputPos.x - px;
-  const offsetY = inputPos.y - py;
-  const distanceSqr = offsetX * offsetX + offsetY * offsetY;
-  if (distanceSqr >= radius * radius) return;
+    const substeps = Math.max(1, config.substeps);
+    const subDelta = deltaTime / substeps;
+    for (let step = 0; step < substeps; step++) {
+      this.updateUniforms(subDelta);
 
-  const distance = Math.sqrt(distanceSqr);
-  const dirX = distance <= 0 ? 0 : offsetX / distance;
-  const dirY = distance <= 0 ? 0 : offsetY / distance;
-  const centerT = 1 - distance / radius;
+      const commandEncoder = this.device.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      const workgroupCount = Math.ceil(this.paddedParticlesCount / 256);
 
-  const velocity = velocities[particleIndex];
-  const fx = (dirX * strength - velocity.x) * centerT;
-  const fy = (dirY * strength - velocity.y) * centerT;
-  velocity.x += fx * delta;
-  velocity.y += fy * delta;
-}
+      pass.setBindGroup(0, this.mainBindGroup);
 
-function setParticleGridPosition(): void {
-  const numParticles = config.numParticles;
-  const particlesPerRow = Math.floor(Math.sqrt(numParticles));
-  const particlesPerCol = Math.ceil(numParticles / particlesPerRow);
-  const spacing = config.particleSize * 2 + config.particleSpacing;
+      pass.setPipeline(this.externalForcesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
 
-  for (let i = 0; i < numParticles; i++) {
-    const column = i % particlesPerRow;
-    const row = Math.floor(i / particlesPerRow);
+      pass.setPipeline(this.updateSpatialHashPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
 
-    let x = (column - particlesPerRow / 2 + 0.5) * spacing;
-    let y = (row - particlesPerCol / 2 + 0.5) * spacing;
+      pass.setPipeline(this.bitonicSortPipeline);
+      for (let s = 0; s < this.bitonicSteps.length; s++) {
+        pass.setBindGroup(1, this.bitonicBindGroup, [
+          s * this.uniformAlignment,
+        ]);
+        pass.dispatchWorkgroups(workgroupCount);
+      }
 
-    x = THREE.MathUtils.clamp(x, -halfBounds.x, halfBounds.x);
-    y = THREE.MathUtils.clamp(y, -halfBounds.y, halfBounds.y);
+      pass.setPipeline(this.clearStartIndicesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
 
-    positions[i].set(x, y);
+      pass.setPipeline(this.calculateStartIndicesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.calculateDensitiesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.calculateForcesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.integratePositionsPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.end();
+      this.device.queue.submit([commandEncoder.finish()]);
+    }
   }
-}
+  public async fetchParticleData(): Promise<Float32Array> {
+    if (!this.isInitialized || this.isMapping) return this.cachedParticleData;
 
-function clearParticles(): void {
-  positions.length = 0;
-  predictedPositions.length = 0;
-  velocities.length = 0;
-  densities.length = 0;
-  spatialLookup.length = 0;
-  startIndices.length = 0;
-}
+    this.isMapping = true;
+    try {
+      const particleByteSize = 32;
+      const readSize = config.numParticles * particleByteSize;
 
-function start(): void {
-  updateHalfBounds();
-  clearParticles();
-  for (let i = 0; i < config.numParticles; i++) {
-    velocities.push(new THREE.Vector2());
-    positions.push(new THREE.Vector2());
-    predictedPositions.push(new THREE.Vector2());
-  }
-
-  particles.setParticleCount(config.numParticles);
-  setParticleGridPosition();
-}
-
-function update(delta: number): void {
-  if (config.paused) return;
-
-  updateHalfBounds();
-
-  for (let i = 0; i < config.numParticles; i++) {
-    velocities[i].addScaledVector(DOWN, config.gravity * delta);
-
-    if (interactionStrength !== 0)
-      applyInteractionForce(
-        interactionPosition,
-        config.interactionRadius,
-        interactionStrength,
-        i,
-        delta,
+      const commandEncoder = this.device.createCommandEncoder();
+      commandEncoder.copyBufferToBuffer(
+        this.particlesBuffer,
+        0,
+        this.stagingBuffer,
+        0,
+        readSize,
       );
+      this.device.queue.submit([commandEncoder.finish()]);
 
-    predictedPositions[i]
-      .copy(positions[i])
-      .addScaledVector(velocities[i], delta);
+      await this.stagingBuffer.mapAsync(GPUMapMode.READ, 0, readSize);
+
+      if (this.stagingBuffer.mapState === "mapped") {
+        const mappedArray = new Float32Array(
+          this.stagingBuffer.getMappedRange(0, readSize),
+        );
+        this.cachedParticleData.set(mappedArray);
+        this.stagingBuffer.unmap();
+      }
+    } catch {
+    } finally {
+      this.isMapping = false;
+    }
+
+    return this.cachedParticleData;
   }
-
-  updateSpatialLookup(predictedPositions, config.smoothingRadius);
-  updateDensities();
-
-  for (let i = 0; i < config.numParticles; i++) {
-    const density = densities[i];
-    if (density <= 0) continue;
-
-    const totalForce = calculatePressureAndViscosityForces(i);
-    const acceleration = totalForce.divideScalar(density);
-    velocities[i].addScaledVector(acceleration, delta);
+  public setInteraction(pos: THREE.Vector2, strength: number): void {
+    this.interactionPosition.copy(pos);
+    this.interactionStrength = strength;
   }
+  public getDevice(): GPUDevice {
+    return this.device;
+  }
+  public getParticlesBuffer(): GPUBuffer {
+    return this.particlesBuffer;
+  }
+  public recordStepCommands(
+    commandEncoder: GPUCommandEncoder,
+    deltaTime: number,
+  ): void {
+    if (!this.isInitialized || config.paused) return;
 
-  for (let i = 0; i < config.numParticles; i++) {
-    positions[i].addScaledVector(velocities[i], delta);
-    resolveCollisions(positions[i], velocities[i]);
+    const substeps = Math.max(1, config.substeps);
+    const subDelta = deltaTime / substeps;
+
+    for (let step = 0; step < substeps; step++) {
+      this.updateUniforms(subDelta);
+      const pass = commandEncoder.beginComputePass();
+      const workgroupCount = Math.ceil(this.paddedParticlesCount / 256);
+
+      pass.setBindGroup(0, this.mainBindGroup);
+
+      pass.setPipeline(this.externalForcesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.updateSpatialHashPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.bitonicSortPipeline);
+      for (let s = 0; s < this.bitonicSteps.length; s++) {
+        pass.setBindGroup(1, this.bitonicBindGroup, [
+          s * this.uniformAlignment,
+        ]);
+        pass.dispatchWorkgroups(workgroupCount);
+      }
+
+      pass.setPipeline(this.clearStartIndicesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.calculateStartIndicesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.calculateDensitiesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.calculateForcesPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.setPipeline(this.integratePositionsPipeline);
+      pass.dispatchWorkgroups(workgroupCount);
+
+      pass.end();
+    }
   }
 }
-
-function syncVisuals(): void {
-  for (let i = 0; i < config.numParticles; i++) {
-    const p = positions[i];
-    const speed = velocities[i].length();
-    particles.updateParticle(i, p.x, p.y, speed);
-  }
-
-  particles.commitParticles();
-}
-
-function setParticleSize(size: number): void {
-  particles.setParticleSize(size);
-}
-
-function setInteraction(position: THREE.Vector2, strength: number): void {
-  interactionPosition.copy(position);
-  interactionStrength = strength;
-}
-
-export {
-  update,
-  start,
-  syncVisuals,
-  setParticleSize,
-  setParticleGridPosition,
-  setInteraction,
-};
