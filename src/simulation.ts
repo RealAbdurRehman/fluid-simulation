@@ -5,6 +5,8 @@ import * as particles from "./particles";
 
 const DOWN: THREE.Vector2 = new THREE.Vector2(0, -1);
 
+const halfBounds = new THREE.Vector2();
+
 const positions: THREE.Vector2[] = [];
 const predictedPositions: THREE.Vector2[] = [];
 const velocities: THREE.Vector2[] = [];
@@ -12,6 +14,7 @@ const velocities: THREE.Vector2[] = [];
 const particleMass = 1;
 
 const densities: number[] = [];
+const nearDensities: number[] = [];
 
 class Entry {
   index: number;
@@ -32,129 +35,6 @@ const cellOffsets: [number, number][] = [];
 for (let y = -1; y <= 1; y++)
   for (let x = -1; x <= 1; x++) cellOffsets.push([x, y]);
 
-function smoothingKernel(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
-  return ((radius - distance) * (radius - distance)) / volume;
-}
-
-function smoothingKernelDerivative(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const scale = 12 / (Math.PI * Math.pow(radius, 4));
-  return (distance - radius) * scale;
-}
-
-function calculateDensity(point: THREE.Vector2): number {
-  let density = 0;
-  foreachPointWithinRadius(point, (particleIndex) => {
-    const distance = predictedPositions[particleIndex].distanceTo(point);
-    const influence = smoothingKernel(config.smoothingRadius, distance);
-    density += particleMass * influence;
-  });
-
-  return density;
-}
-
-function updateDensities(): void {
-  for (let i = 0; i < config.numParticles; i++)
-    densities[i] = calculateDensity(predictedPositions[i]);
-}
-
-function convertDensityToPressure(density: number): number {
-  const densityError = density - config.targetDensity;
-  const pressure = densityError * config.pressureMultiplier;
-  return pressure;
-}
-
-function calculateSharedPressure(densityA: number, densityB: number): number {
-  const pressureA = convertDensityToPressure(densityA);
-  const pressureB = convertDensityToPressure(densityB);
-  return (pressureA + pressureB) / 2;
-}
-
-function calculatePressureForce(particleIndex: number): THREE.Vector2 {
-  const pressureForce = new THREE.Vector2();
-  const point = predictedPositions[particleIndex];
-
-  foreachPointWithinRadius(point, (neighborIndex) => {
-    if (neighborIndex === particleIndex) return;
-    const neighbor = predictedPositions[neighborIndex];
-
-    const dx = neighbor.x - point.x;
-    const dy = neighbor.y - point.y;
-
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    if (distance === 0) return;
-
-    const direction = new THREE.Vector2(dx / distance, dy / distance);
-    const slope = smoothingKernelDerivative(config.smoothingRadius, distance);
-
-    const density = densities[neighborIndex];
-    if (density <= 0) return;
-
-    const sharedPressure = calculateSharedPressure(
-      density,
-      densities[particleIndex],
-    );
-    const scalar = (sharedPressure * slope * particleMass) / density;
-    pressureForce.addScaledVector(direction, scalar);
-  });
-
-  return pressureForce;
-}
-
-function viscositySmoothingKernel(radius: number, distance: number): number {
-  if (distance >= radius) return 0;
-
-  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
-  return ((radius - distance) * (radius - distance)) / volume;
-}
-
-function calculateViscosityForce(particleIndex: number): THREE.Vector2 {
-  const viscosityForce = new THREE.Vector2();
-  const position = predictedPositions[particleIndex];
-  foreachPointWithinRadius(position, (neighborIndex) => {
-    const distance = position
-      .clone()
-      .sub(predictedPositions[neighborIndex])
-      .length();
-    const influence = viscositySmoothingKernel(
-      config.smoothingRadius,
-      distance,
-    );
-    viscosityForce.addScaledVector(
-      velocities[neighborIndex].clone().sub(velocities[particleIndex]),
-      influence,
-    );
-  });
-
-  return viscosityForce.multiplyScalar(config.viscosityStrength);
-}
-
-function getHalfBounds(): THREE.Vector2 {
-  return new THREE.Vector2(
-    config.boundsWidth / 2 - config.particleSize,
-    config.boundsHeight / 2 - config.particleSize,
-  );
-}
-
-function resolveCollisions(
-  position: THREE.Vector2,
-  velocity: THREE.Vector2,
-): void {
-  const halfBounds = getHalfBounds();
-  if (Math.abs(position.x) > halfBounds.x) {
-    position.x = halfBounds.x * Math.sign(position.x);
-    velocity.x *= -1 * config.collisionDamping;
-  }
-  if (Math.abs(position.y) > halfBounds.y) {
-    position.y = halfBounds.y * Math.sign(position.y);
-    velocity.y *= -1 * config.collisionDamping;
-  }
-}
-
 function positionToCellCoord(
   point: THREE.Vector2,
   radius: number,
@@ -172,24 +52,6 @@ function hashCell(cellX: number, cellY: number): number {
 
 function getKeyFromHash(hash: number, tableSize: number): number {
   return hash % tableSize;
-}
-
-function updateSpatialLookup(points: THREE.Vector2[], radius: number): void {
-  for (let i = 0; i < points.length; i++) {
-    const [cellX, cellY] = positionToCellCoord(points[i], radius);
-    const cellKey = getKeyFromHash(hashCell(cellX, cellY), points.length);
-    spatialLookup[i] = new Entry(i, cellKey);
-    startIndices[i] = Number.MAX_SAFE_INTEGER;
-  }
-
-  spatialLookup.sort((a, b) => a.key - b.key);
-
-  for (let i = 0; i < points.length; i++) {
-    const key = spatialLookup[i].key;
-    const keyPrev =
-      i === 0 ? Number.MAX_SAFE_INTEGER : spatialLookup[i - 1].key;
-    if (key !== keyPrev) startIndices[key] = i;
-  }
 }
 
 function foreachPointWithinRadius(
@@ -220,30 +82,220 @@ function foreachPointWithinRadius(
   }
 }
 
-function interactionForce(
+function smoothingKernel(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
+  return ((radius - distance) * (radius - distance)) / volume;
+}
+
+function smoothingKernelDerivative(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const scale = 12 / (Math.PI * Math.pow(radius, 4));
+  return (distance - radius) * scale;
+}
+
+function nearSmoothingKernel(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const volume = (Math.PI * Math.pow(radius, 5)) / 10;
+  return Math.pow(radius - distance, 3) / volume;
+}
+
+function nearSmoothingKernelDerivative(
+  radius: number,
+  distance: number,
+): number {
+  if (distance >= radius) return 0;
+
+  const scale = 30 / (Math.PI * Math.pow(radius, 5));
+  return -(radius - distance) * (radius - distance) * scale;
+}
+
+function calculateDensity(point: THREE.Vector2): [number, number] {
+  let density = 0;
+  let nearDensity = 0;
+  foreachPointWithinRadius(point, (particleIndex) => {
+    const distance = predictedPositions[particleIndex].distanceTo(point);
+    density += particleMass * smoothingKernel(config.smoothingRadius, distance);
+    nearDensity +=
+      particleMass * nearSmoothingKernel(config.smoothingRadius, distance);
+  });
+
+  return [density, nearDensity];
+}
+
+function updateDensities(): void {
+  for (let i = 0; i < config.numParticles; i++) {
+    const [density, nearDensity] = calculateDensity(predictedPositions[i]);
+    densities[i] = density;
+    nearDensities[i] = nearDensity;
+  }
+}
+
+function convertDensityToPressure(density: number): number {
+  const densityError = density - config.targetDensity;
+  return densityError * config.pressureMultiplier;
+}
+
+function convertNearDensityToPressure(nearDensity: number): number {
+  return nearDensity * config.nearDensityMultiplier;
+}
+
+function calculateSharedPressure(densityA: number, densityB: number): number {
+  return (
+    (convertDensityToPressure(densityA) + convertDensityToPressure(densityB)) /
+    2
+  );
+}
+
+function calculateSharedNearPressure(
+  nearDensityA: number,
+  nearDensityB: number,
+): number {
+  return (
+    (convertNearDensityToPressure(nearDensityA) +
+      convertNearDensityToPressure(nearDensityB)) /
+    2
+  );
+}
+
+function viscositySmoothingKernel(radius: number, distance: number): number {
+  if (distance >= radius) return 0;
+
+  const volume = (Math.PI * Math.pow(radius, 4)) / 6;
+  return ((radius - distance) * (radius - distance)) / volume;
+}
+
+function calculatePressureAndViscosityForces(
+  particleIndex: number,
+): THREE.Vector2 {
+  const totalForce = new THREE.Vector2();
+  const point = predictedPositions[particleIndex];
+  const density = densities[particleIndex];
+  const nearDensity = nearDensities[particleIndex];
+  const velocity = velocities[particleIndex];
+
+  foreachPointWithinRadius(point, (neighborIndex) => {
+    if (neighborIndex === particleIndex) return;
+    const neighbor = predictedPositions[neighborIndex];
+
+    const dx = neighbor.x - point.x;
+    const dy = neighbor.y - point.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance === 0) return;
+
+    const dirX = dx / distance;
+    const dirY = dy / distance;
+
+    const neighborDensity = densities[neighborIndex];
+    const neighborNearDensity = nearDensities[neighborIndex];
+
+    if (neighborDensity > 0) {
+      const slope = smoothingKernelDerivative(config.smoothingRadius, distance);
+      const sharedPressure = calculateSharedPressure(neighborDensity, density);
+      const scalar = (sharedPressure * slope * particleMass) / neighborDensity;
+      totalForce.x += dirX * scalar;
+      totalForce.y += dirY * scalar;
+    }
+
+    if (neighborNearDensity > 0) {
+      const nearSlope = nearSmoothingKernelDerivative(
+        config.smoothingRadius,
+        distance,
+      );
+      const sharedNearPressure = calculateSharedNearPressure(
+        neighborNearDensity,
+        nearDensity,
+      );
+      const nearScalar =
+        (sharedNearPressure * nearSlope * particleMass) / neighborNearDensity;
+      totalForce.x += dirX * nearScalar;
+      totalForce.y += dirY * nearScalar;
+    }
+
+    const influence = viscositySmoothingKernel(
+      config.smoothingRadius,
+      distance,
+    );
+    const neighborVel = velocities[neighborIndex];
+    const scalarVisc = influence * config.viscosityStrength;
+    totalForce.x += (neighborVel.x - velocity.x) * scalarVisc;
+    totalForce.y += (neighborVel.y - velocity.y) * scalarVisc;
+  });
+
+  return totalForce;
+}
+
+function updateHalfBounds(): void {
+  halfBounds.set(
+    config.boundsWidth / 2 - config.particleSize,
+    config.boundsHeight / 2 - config.particleSize,
+  );
+}
+
+function resolveCollisions(
+  position: THREE.Vector2,
+  velocity: THREE.Vector2,
+): void {
+  if (Math.abs(position.x) > halfBounds.x) {
+    position.x = halfBounds.x * Math.sign(position.x);
+    velocity.x *= -1 * config.collisionDamping;
+  }
+  if (Math.abs(position.y) > halfBounds.y) {
+    position.y = halfBounds.y * Math.sign(position.y);
+    velocity.y *= -1 * config.collisionDamping;
+  }
+}
+
+function updateSpatialLookup(points: THREE.Vector2[], radius: number): void {
+  for (let i = 0; i < points.length; i++) {
+    const [cellX, cellY] = positionToCellCoord(points[i], radius);
+    const cellKey = getKeyFromHash(hashCell(cellX, cellY), points.length);
+
+    if (spatialLookup[i]) {
+      spatialLookup[i].index = i;
+      spatialLookup[i].key = cellKey;
+    } else spatialLookup[i] = new Entry(i, cellKey);
+
+    startIndices[i] = Number.MAX_SAFE_INTEGER;
+  }
+
+  spatialLookup.sort((a, b) => a.key - b.key);
+
+  for (let i = 0; i < points.length; i++) {
+    const key = spatialLookup[i].key;
+    const keyPrev =
+      i === 0 ? Number.MAX_SAFE_INTEGER : spatialLookup[i - 1].key;
+    if (key !== keyPrev) startIndices[key] = i;
+  }
+}
+
+function applyInteractionForce(
   inputPos: THREE.Vector2,
   radius: number,
   strength: number,
   particleIndex: number,
-): THREE.Vector2 {
-  const interactionForce = new THREE.Vector2();
-  const offset = inputPos.clone().sub(positions[particleIndex]);
-  const distanceSqr = offset.dot(offset);
+  delta: number,
+): void {
+  const px = positions[particleIndex].x;
+  const py = positions[particleIndex].y;
+  const offsetX = inputPos.x - px;
+  const offsetY = inputPos.y - py;
+  const distanceSqr = offsetX * offsetX + offsetY * offsetY;
+  if (distanceSqr >= radius * radius) return;
 
-  if (distanceSqr < radius * radius) {
-    const distance = Math.sqrt(distanceSqr);
-    const directionToInputPoint =
-      distance <= 0 ? new THREE.Vector2() : offset.divideScalar(distance);
-    const centerT = 1 - distance / radius;
-    interactionForce.addScaledVector(
-      directionToInputPoint
-        .multiplyScalar(strength)
-        .sub(velocities[particleIndex]),
-      centerT,
-    );
-  }
+  const distance = Math.sqrt(distanceSqr);
+  const dirX = distance <= 0 ? 0 : offsetX / distance;
+  const dirY = distance <= 0 ? 0 : offsetY / distance;
+  const centerT = 1 - distance / radius;
 
-  return interactionForce;
+  const velocity = velocities[particleIndex];
+  const fx = (dirX * strength - velocity.x) * centerT;
+  const fy = (dirY * strength - velocity.y) * centerT;
+  velocity.x += fx * delta;
+  velocity.y += fy * delta;
 }
 
 function setParticleGridPosition(): void {
@@ -259,7 +311,6 @@ function setParticleGridPosition(): void {
     let x = (column - particlesPerRow / 2 + 0.5) * spacing;
     let y = (row - particlesPerCol / 2 + 0.5) * spacing;
 
-    const halfBounds = getHalfBounds();
     x = THREE.MathUtils.clamp(x, -halfBounds.x, halfBounds.x);
     y = THREE.MathUtils.clamp(y, -halfBounds.y, halfBounds.y);
 
@@ -277,6 +328,7 @@ function clearParticles(): void {
 }
 
 function start(): void {
+  updateHalfBounds();
   clearParticles();
   for (let i = 0; i < config.numParticles; i++) {
     velocities.push(new THREE.Vector2());
@@ -291,17 +343,17 @@ function start(): void {
 function update(delta: number): void {
   if (config.paused) return;
 
+  updateHalfBounds();
+
   for (let i = 0; i < config.numParticles; i++) {
     velocities[i].addScaledVector(DOWN, config.gravity * delta);
 
     if (interactionStrength !== 0)
-      velocities[i].addScaledVector(
-        interactionForce(
-          interactionPosition,
-          config.interactionRadius,
-          interactionStrength,
-          i,
-        ),
+      applyInteractionForce(
+        interactionPosition,
+        config.interactionRadius,
+        interactionStrength,
+        i,
         delta,
       );
 
@@ -317,13 +369,9 @@ function update(delta: number): void {
     const density = densities[i];
     if (density <= 0) continue;
 
-    const pressureForce = calculatePressureForce(i);
-    const pressureAcceleration = pressureForce.divideScalar(density);
-    velocities[i].addScaledVector(pressureAcceleration, delta);
-
-    const viscosityForce = calculateViscosityForce(i);
-    const viscosityAcceleration = viscosityForce.divideScalar(density);
-    velocities[i].addScaledVector(viscosityAcceleration, delta);
+    const totalForce = calculatePressureAndViscosityForces(i);
+    const acceleration = totalForce.divideScalar(density);
+    velocities[i].addScaledVector(acceleration, delta);
   }
 
   for (let i = 0; i < config.numParticles; i++) {
