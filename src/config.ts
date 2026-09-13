@@ -26,8 +26,8 @@ export const PRESETS: Record<string, SimulationPreset> = {
     particleSpacing: 0.04,
     substeps: 1,
   },
-  "Viscous Slime": {
-    name: "Viscous Slime",
+  "Slimey Liquid": {
+    name: "Slimey Liquid",
     gravity: 9.81,
     collisionDamping: 0.1,
     targetDensity: 8.0,
@@ -87,7 +87,7 @@ export function setupGUI(
   onUpdateBounds: () => void,
   onUpdateParticleSize: (size: number) => void,
 ): GUI {
-  const gui = new GUI({ title: "3D Fluid Simulation" });
+  const gui = new GUI({ title: "Fluid Simulation" });
 
   const presetFolder = gui.addFolder("Presets");
   presetFolder
