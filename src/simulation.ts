@@ -243,20 +243,37 @@ export class FluidSimulationGPU {
     const numParticles = config.numParticles;
     const initialData = new Float32Array(this.paddedParticlesCount * 16);
 
-    const halfBoundX = config.boundsWidth / 2 - config.particleSize * 1.5;
-    const halfBoundY = config.boundsHeight / 2 - config.particleSize * 1.5;
-    const halfBoundZ = config.boundsDepth / 2 - config.particleSize * 1.5;
+    const margin = config.particleSize * 1.5;
+    const usableWidth = config.boundsWidth - margin * 2;
+    const usableHeight = config.boundsHeight - margin * 2;
+    const usableDepth = config.boundsDepth - margin * 2;
 
-    const spawnDimX = Math.min(halfBoundX * 1.6, 6.0);
-    const spawnDimZ = Math.min(halfBoundZ * 1.6, 6.0);
+    const perAxis = Math.max(1, Math.ceil(Math.cbrt(numParticles)));
+    const countX = perAxis;
+    const countY = perAxis;
+    const countZ = perAxis;
 
-    const spacing = config.particleSize * 1.8 + config.particleSpacing;
-    const countX = Math.max(1, Math.floor(spawnDimX / spacing));
-    const countZ = Math.max(1, Math.floor(spawnDimZ / spacing));
+    const baseSpacing = config.particleSize * 1.8 + config.particleSpacing;
+    const maxSpacingX = countX > 1 ? usableWidth / (countX - 1) : baseSpacing;
+    const maxSpacingY = countY > 1 ? usableHeight / (countY - 1) : baseSpacing;
+    const maxSpacingZ = countZ > 1 ? usableDepth / (countZ - 1) : baseSpacing;
+    const spacing = Math.min(
+      baseSpacing,
+      maxSpacingX,
+      maxSpacingY,
+      maxSpacingZ,
+    );
 
-    const startX = -((countX - 1) * spacing) / 2;
-    const startY = -halfBoundY + config.particleSize * 2;
-    const startZ = -((countZ - 1) * spacing) / 2;
+    const gridWidthX = (countX - 1) * spacing;
+    const gridWidthZ = (countZ - 1) * spacing;
+
+    const startX = -gridWidthX / 2;
+    const startY = -config.boundsHeight / 2 + margin;
+    const startZ = -gridWidthZ / 2;
+
+    const halfBoundX = config.boundsWidth / 2 - margin;
+    const halfBoundY = config.boundsHeight / 2 - margin;
+    const halfBoundZ = config.boundsDepth / 2 - margin;
 
     for (let i = 0; i < numParticles; i++) {
       const xIdx = i % countX;
