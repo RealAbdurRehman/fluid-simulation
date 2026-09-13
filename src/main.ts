@@ -3,61 +3,94 @@ import * as THREE from "three";
 import { config, setupGUI } from "./config";
 import { FluidSimulationGPU } from "./simulation";
 import { GPUParticleRenderer } from "./renderer";
-import { scene, camera, controls, renderer, setBoundsSize } from "./scene";
+import { SceneRenderer } from "./sceneRenderer";
+import { camera, attachControls, resizeCamera } from "./scene";
 
 async function bootstrap() {
-  const gpuCanvas = document.createElement("canvas");
-  gpuCanvas.width = window.innerWidth * window.devicePixelRatio;
-  gpuCanvas.height = window.innerHeight * window.devicePixelRatio;
-  gpuCanvas.style.position = "absolute";
-  gpuCanvas.style.top = "0";
-  gpuCanvas.style.left = "0";
-  gpuCanvas.style.width = "100vw";
-  gpuCanvas.style.height = "100vh";
-  gpuCanvas.style.pointerEvents = "none";
-  document.getElementById("app")!.appendChild(gpuCanvas);
-
   const simulation = new FluidSimulationGPU();
   const initialized = await simulation.initialize();
-  if (!initialized) return;
+  if (!initialized) {
+    console.error("Simulation failed to initialize (no WebGPU?)");
+    return;
+  }
 
-  const gpuRenderer = new GPUParticleRenderer(
-    simulation.getDevice(),
-    gpuCanvas,
+  const device = simulation.getDevice();
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  const canvas = document.createElement("canvas");
+  canvas.style.position = "fixed";
+  canvas.style.top = "0";
+  canvas.style.left = "0";
+  canvas.style.width = "100vw";
+  canvas.style.height = "100vh";
+  canvas.style.display = "block";
+  canvas.style.zIndex = "0";
+  document.body.appendChild(canvas);
+
+  const contextOrNull = canvas.getContext("webgpu") as GPUCanvasContext | null;
+  if (!contextOrNull) {
+    console.error("Failed to acquire WebGPU canvas context");
+    return;
+  }
+  const context: GPUCanvasContext = contextOrNull;
+  context.configure({
+    device,
+    format,
+    alphaMode: "opaque",
+  });
+
+  const controls = attachControls(canvas);
+
+  const sceneRenderer = new SceneRenderer(device, format);
+  const particleRenderer = new GPUParticleRenderer(
+    device,
     simulation.getParticlesBuffer(),
+    format,
   );
 
   const viewMatrixArray = new Float32Array(16);
   const projMatrixArray = new Float32Array(16);
+  const viewProjArray = new Float32Array(16);
+
+  const zRemap = new THREE.Matrix4().set(
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0.5,
+    0.5,
+    0,
+    0,
+    0,
+    1,
+  );
+  const tmpMat = new THREE.Matrix4();
 
   setupGUI(
     () => simulation.updateParticleCount(),
-    () =>
-      setBoundsSize(
-        config.boundsWidth,
-        config.boundsHeight,
-        config.boundsDepth,
-      ),
+    () => {},
     () => {},
   );
 
-  setBoundsSize(config.boundsWidth, config.boundsHeight, config.boundsDepth);
-
-  window.addEventListener("resize", () => {
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+  function resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
     const dpr = Math.min(window.devicePixelRatio, 2);
 
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(dpr);
+    canvas.width = Math.max(1, Math.floor(w * dpr));
+    canvas.height = Math.max(1, Math.floor(h * dpr));
+    resizeCamera();
+    sceneRenderer.resize(canvas.width, canvas.height);
+  }
 
-    gpuCanvas.width = width * dpr;
-    gpuCanvas.height = height * dpr;
-    gpuRenderer.resize(gpuCanvas.width, gpuCanvas.height);
-
-    camera.aspect = width / height;
-    camera.updateProjectionMatrix();
-  });
+  resize();
+  window.addEventListener("resize", resize);
 
   const mouse = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
@@ -66,7 +99,7 @@ async function bootstrap() {
   let interactionMode: "push" | "pull" | null = null;
 
   function updateRaycast(e: MouseEvent) {
-    const rect = renderer.domElement.getBoundingClientRect();
+    const rect = canvas.getBoundingClientRect();
     mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
@@ -84,11 +117,9 @@ async function bootstrap() {
     }
   }
 
-  renderer.domElement.addEventListener("contextmenu", (e) =>
-    e.preventDefault(),
-  );
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-  renderer.domElement.addEventListener("mousedown", (e) => {
+  canvas.addEventListener("mousedown", (e) => {
     if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
       controls.enabled = false;
       isInteracting = true;
@@ -142,23 +173,52 @@ async function bootstrap() {
     camera.matrixWorld.extractBasis(cameraRight, cameraUp, new THREE.Vector3());
     camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
     camera.matrixWorldInverse.toArray(viewMatrixArray);
-    camera.projectionMatrix.toArray(projMatrixArray);
 
-    const commandEncoder = simulation.getDevice().createCommandEncoder();
+    tmpMat.copy(camera.projectionMatrix).premultiply(zRemap);
+    tmpMat.toArray(projMatrixArray);
+
+    tmpMat.multiply(camera.matrixWorldInverse);
+    tmpMat.toArray(viewProjArray);
+
+    const encoder = device.createCommandEncoder();
+
     if (stepOnce) {
-      simulation.recordStepCommands(commandEncoder, FIXED_DELTA, true);
+      simulation.recordStepCommands(encoder, FIXED_DELTA, true);
       stepOnce = false;
     } else {
       while (accumulator >= FIXED_DELTA) {
-        simulation.recordStepCommands(commandEncoder, FIXED_DELTA);
+        simulation.recordStepCommands(encoder, FIXED_DELTA);
         accumulator -= FIXED_DELTA;
       }
     }
 
-    renderer.render(scene, camera);
+    sceneRenderer.updateFrame(viewProjArray, [
+      camera.position.x,
+      camera.position.y,
+      camera.position.z,
+    ]);
 
-    gpuRenderer.render(
-      commandEncoder,
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: sceneRenderer.getMSAAView(),
+          resolveTarget: context.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: "clear",
+          storeOp: "discard",
+        },
+      ],
+      depthStencilAttachment: {
+        view: sceneRenderer.getDepthView(),
+        depthClearValue: 1.0,
+        depthLoadOp: "clear",
+        depthStoreOp: "discard",
+      },
+    });
+
+    sceneRenderer.encode(pass);
+    particleRenderer.encode(
+      pass,
       viewMatrixArray,
       projMatrixArray,
       [cameraRight.x, cameraRight.y, cameraRight.z],
@@ -166,7 +226,9 @@ async function bootstrap() {
       config.numParticles,
     );
 
-    simulation.getDevice().queue.submit([commandEncoder.finish()]);
+    pass.end();
+
+    device.queue.submit([encoder.finish()]);
     requestAnimationFrame(animate);
   }
 
