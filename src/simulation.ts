@@ -1,8 +1,7 @@
 import * as THREE from "three";
-
 import { config } from "./config";
 import { fluidComputeShaderWGSL } from "./shader/fluidCompute.wgsl";
-import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
+import { GPUShaderStage, GPUBufferUsage } from "./types";
 
 interface BitonicStep {
   k: number;
@@ -23,7 +22,6 @@ export class FluidSimulationGPU {
   private startIndicesBuffer!: GPUBuffer;
   private simParamsBuffer!: GPUBuffer;
   private bitonicParamsBuffer!: GPUBuffer;
-  private stagingBuffer!: GPUBuffer;
 
   private externalForcesPipeline!: GPUComputePipeline;
   private updateSpatialHashPipeline!: GPUComputePipeline;
@@ -38,10 +36,8 @@ export class FluidSimulationGPU {
   private bitonicBindGroup!: GPUBindGroup;
   private bitonicBindGroupLayout!: GPUBindGroupLayout;
 
-  private isMapping = false;
-  private cachedParticleData = new Float32Array(0);
-
-  private interactionPosition = new THREE.Vector2();
+  private rayOrigin = new THREE.Vector3();
+  private rayDir = new THREE.Vector3();
   private interactionStrength = 0;
   public async initialize(): Promise<boolean> {
     if (!navigator.gpu) {
@@ -159,14 +155,11 @@ export class FluidSimulationGPU {
   }
   private allocateFixedBuffers(): void {
     this.maxPaddedCount = this.nextPowerOfTwo(config.maxParticles);
-    const particleByteSize = 32;
+    const particleByteSize = 64;
 
     this.particlesBuffer = this.device.createBuffer({
       size: this.maxPaddedCount * particleByteSize,
-      usage:
-        GPUBufferUsage.STORAGE |
-        GPUBufferUsage.COPY_DST |
-        GPUBufferUsage.COPY_SRC,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
     this.spatialLookupBuffer = this.device.createBuffer({
@@ -180,7 +173,7 @@ export class FluidSimulationGPU {
     });
 
     this.simParamsBuffer = this.device.createBuffer({
-      size: 112,
+      size: 160,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -196,13 +189,6 @@ export class FluidSimulationGPU {
       size: totalBitonicBytes,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
-    this.stagingBuffer = this.device.createBuffer({
-      size: this.maxPaddedCount * particleByteSize,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-
-    this.cachedParticleData = new Float32Array(this.maxPaddedCount * 8);
 
     this.mainBindGroup = this.device.createBindGroup({
       layout: this.externalForcesPipeline.getBindGroupLayout(0),
@@ -255,183 +241,113 @@ export class FluidSimulationGPU {
   }
   public initParticleGrid(): void {
     const numParticles = config.numParticles;
-    const initialData = new Float32Array(this.paddedParticlesCount * 8);
+    const initialData = new Float32Array(this.paddedParticlesCount * 16);
 
     const halfBoundX = config.boundsWidth / 2 - config.particleSize * 1.5;
     const halfBoundY = config.boundsHeight / 2 - config.particleSize * 1.5;
+    const halfBoundZ = config.boundsDepth / 2 - config.particleSize * 1.5;
 
-    const availableWidth = halfBoundX * 2;
-    const availableHeight = halfBoundY * 2;
+    const spawnDimX = Math.min(halfBoundX * 1.6, 6.0);
+    const spawnDimZ = Math.min(halfBoundZ * 1.6, 6.0);
 
-    const aspectRatio = Math.max(0.1, availableWidth / availableHeight);
-    let particlesPerRow = Math.max(
-      1,
-      Math.round(Math.sqrt(numParticles * aspectRatio)),
-    );
-    let particlesPerCol = Math.ceil(numParticles / particlesPerRow);
+    const spacing = config.particleSize * 1.8 + config.particleSpacing;
+    const countX = Math.max(1, Math.floor(spawnDimX / spacing));
+    const countZ = Math.max(1, Math.floor(spawnDimZ / spacing));
 
-    const maxSpacingX = availableWidth / Math.max(1, particlesPerRow);
-    const maxSpacingY = availableHeight / Math.max(1, particlesPerCol);
-    const spacing = Math.min(
-      config.particleSize * 2 + config.particleSpacing,
-      Math.min(maxSpacingX, maxSpacingY) * 0.95,
-    );
-
-    const startX = -((particlesPerRow - 1) * spacing) / 2;
-    const startY = -((particlesPerCol - 1) * spacing) / 2;
+    const startX = -((countX - 1) * spacing) / 2;
+    const startY = -halfBoundY + config.particleSize * 2;
+    const startZ = -((countZ - 1) * spacing) / 2;
 
     for (let i = 0; i < numParticles; i++) {
-      const col = i % particlesPerRow;
-      const row = Math.floor(i / particlesPerRow);
+      const xIdx = i % countX;
+      const zIdx = Math.floor(i / countX) % countZ;
+      const yIdx = Math.floor(i / (countX * countZ));
 
-      let x = startX + col * spacing;
-      let y = startY + row * spacing;
+      let x = startX + xIdx * spacing;
+      let y = startY + yIdx * spacing;
+      let z = startZ + zIdx * spacing;
 
       x = THREE.MathUtils.clamp(x, -halfBoundX, halfBoundX);
       y = THREE.MathUtils.clamp(y, -halfBoundY, halfBoundY);
+      z = THREE.MathUtils.clamp(z, -halfBoundZ, halfBoundZ);
 
-      const offset = i * 8;
+      const offset = i * 16;
       initialData[offset + 0] = x;
       initialData[offset + 1] = y;
-      initialData[offset + 2] = x;
-      initialData[offset + 3] = y;
-      initialData[offset + 4] = 0;
-      initialData[offset + 5] = 0;
-      initialData[offset + 6] = 0;
-      initialData[offset + 7] = 0;
+      initialData[offset + 2] = z;
+      initialData[offset + 3] = 1.0;
+
+      initialData[offset + 4] = x;
+      initialData[offset + 5] = y;
+      initialData[offset + 6] = z;
+      initialData[offset + 7] = 1.0;
     }
 
     this.device.queue.writeBuffer(this.particlesBuffer, 0, initialData);
   }
   public updateUniforms(subDelta: number): void {
     const r = config.smoothingRadius;
-    const r4 = Math.pow(r, 4);
-    const r5 = Math.pow(r, 5);
+    const r6 = Math.pow(r, 6);
+    const r9 = Math.pow(r, 9);
 
-    const poly6Factor = 6 / (Math.PI * r4);
-    const spikyGradFactor = 12 / (Math.PI * r4);
-    const nearSpikyGradFactor = 30 / (Math.PI * r5);
-    const viscFactor = 6 / (Math.PI * r4);
+    const poly6Factor = 315 / (64 * Math.PI * r9);
+    const spikyGradFactor = 45 / (Math.PI * r6);
+    const nearSpikyGradFactor = 45 / (Math.PI * r6);
+    const viscFactor = 45 / (Math.PI * r6);
 
-    const buffer = new ArrayBuffer(112);
+    const buffer = new ArrayBuffer(160);
     const f32 = new Float32Array(buffer);
     const u32 = new Uint32Array(buffer);
 
     f32[0] = config.boundsWidth;
     f32[1] = config.boundsHeight;
-    f32[2] = config.gravity;
-    f32[3] = config.collisionDamping;
+    f32[2] = config.boundsDepth;
+    f32[3] = config.gravity;
 
-    f32[4] = config.targetDensity;
-    f32[5] = config.pressureMultiplier;
-    f32[6] = config.nearDensityMultiplier;
-    f32[7] = config.viscosityStrength;
+    f32[4] = config.collisionDamping;
+    f32[5] = config.targetDensity;
+    f32[6] = config.pressureMultiplier;
+    f32[7] = config.nearDensityMultiplier;
 
-    f32[8] = config.smoothingRadius;
-    f32[9] = 1.0;
-    f32[10] = config.particleSize;
-    f32[11] = subDelta;
+    f32[8] = config.viscosityStrength;
+    f32[9] = config.smoothingRadius;
+    f32[10] = 1.0;
+    f32[11] = config.particleSize;
 
-    u32[12] = config.numParticles;
-    u32[13] = this.paddedParticlesCount;
-    f32[14] = config.interactionRadius;
-    f32[15] = this.interactionStrength;
+    f32[12] = subDelta;
+    u32[13] = config.numParticles;
+    u32[14] = this.paddedParticlesCount;
+    f32[15] = config.interactionRadius;
 
-    f32[16] = this.interactionPosition.x;
-    f32[17] = this.interactionPosition.y;
-    f32[18] = poly6Factor;
-    f32[19] = spikyGradFactor;
+    f32[16] = this.interactionStrength;
+    f32[17] = poly6Factor;
+    f32[18] = spikyGradFactor;
+    f32[19] = nearSpikyGradFactor;
 
-    f32[20] = nearSpikyGradFactor;
-    f32[21] = viscFactor;
+    f32[20] = viscFactor;
+    f32[21] = 0;
     f32[22] = 0;
     f32[23] = 0;
 
+    f32[24] = this.rayOrigin.x;
+    f32[25] = this.rayOrigin.y;
+    f32[26] = this.rayOrigin.z;
+    f32[27] = 0.0;
+
+    f32[28] = this.rayDir.x;
+    f32[29] = this.rayDir.y;
+    f32[30] = this.rayDir.z;
+    f32[31] = 0.0;
+
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }
-  public step(deltaTime: number): void {
-    if (!this.isInitialized || config.paused) return;
-
-    const substeps = Math.max(1, config.substeps);
-    const subDelta = deltaTime / substeps;
-    for (let step = 0; step < substeps; step++) {
-      this.updateUniforms(subDelta);
-
-      const commandEncoder = this.device.createCommandEncoder();
-      const pass = commandEncoder.beginComputePass();
-      const workgroupCount = Math.ceil(this.paddedParticlesCount / 256);
-
-      pass.setBindGroup(0, this.mainBindGroup);
-
-      pass.setPipeline(this.externalForcesPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.updateSpatialHashPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.bitonicSortPipeline);
-      for (let s = 0; s < this.bitonicSteps.length; s++) {
-        pass.setBindGroup(1, this.bitonicBindGroup, [
-          s * this.uniformAlignment,
-        ]);
-        pass.dispatchWorkgroups(workgroupCount);
-      }
-
-      pass.setPipeline(this.clearStartIndicesPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.calculateStartIndicesPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.calculateDensitiesPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.calculateForcesPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.integratePositionsPipeline);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.end();
-      this.device.queue.submit([commandEncoder.finish()]);
-    }
-  }
-  public async fetchParticleData(): Promise<Float32Array> {
-    if (!this.isInitialized || this.isMapping) return this.cachedParticleData;
-
-    this.isMapping = true;
-    try {
-      const particleByteSize = 32;
-      const readSize = config.numParticles * particleByteSize;
-
-      const commandEncoder = this.device.createCommandEncoder();
-      commandEncoder.copyBufferToBuffer(
-        this.particlesBuffer,
-        0,
-        this.stagingBuffer,
-        0,
-        readSize,
-      );
-      this.device.queue.submit([commandEncoder.finish()]);
-
-      await this.stagingBuffer.mapAsync(GPUMapMode.READ, 0, readSize);
-
-      if (this.stagingBuffer.mapState === "mapped") {
-        const mappedArray = new Float32Array(
-          this.stagingBuffer.getMappedRange(0, readSize),
-        );
-        this.cachedParticleData.set(mappedArray);
-        this.stagingBuffer.unmap();
-      }
-    } catch {
-    } finally {
-      this.isMapping = false;
-    }
-
-    return this.cachedParticleData;
-  }
-  public setInteraction(pos: THREE.Vector2, strength: number): void {
-    this.interactionPosition.copy(pos);
+  public setInteraction(
+    rayOrigin: THREE.Vector3,
+    rayDir: THREE.Vector3,
+    strength: number,
+  ): void {
+    this.rayOrigin.copy(rayOrigin);
+    this.rayDir.copy(rayDir).normalize();
     this.interactionStrength = strength;
   }
   public getDevice(): GPUDevice {
@@ -443,8 +359,9 @@ export class FluidSimulationGPU {
   public recordStepCommands(
     commandEncoder: GPUCommandEncoder,
     deltaTime: number,
+    force: boolean = false,
   ): void {
-    if (!this.isInitialized || config.paused) return;
+    if (!this.isInitialized || (config.paused && !force)) return;
 
     const substeps = Math.max(1, config.substeps);
     const subDelta = deltaTime / substeps;

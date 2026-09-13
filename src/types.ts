@@ -17,6 +17,14 @@ export const GPUBufferUsage = {
   QUERY_RESOLVE: 0x0200,
 } as const;
 
+export const GPUTextureUsage = {
+  COPY_SRC: 0x01,
+  COPY_DST: 0x02,
+  TEXTURE_BINDING: 0x04,
+  STORAGE_BINDING: 0x08,
+  RENDER_ATTACHMENT: 0x10,
+} as const;
+
 export const GPUMapMode = {
   READ: 0x0001,
   WRITE: 0x0002,

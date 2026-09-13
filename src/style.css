@@ -9,3 +9,41 @@
 body {
   background-color: #090b12;
 }
+
+#controls-overlay {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 10;
+  color: #ffffff;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 12px;
+  line-height: 1.6;
+  pointer-events: none;
+  user-select: none;
+}
+
+#controls-overlay .controls-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+#controls-overlay ul {
+  list-style: none;
+}
+
+#controls-overlay li {
+  display: flex;
+  gap: 10px;
+}
+
+#controls-overlay li span {
+  min-width: 150px;
+  font-weight: 500;
+}

@@ -1,14 +1,9 @@
 import * as THREE from "three";
+
 import { config, setupGUI } from "./config";
-import {
-  scene,
-  camera,
-  renderer,
-  setCameraDistance,
-  setBoundsSize,
-} from "./scene";
 import { FluidSimulationGPU } from "./simulation";
 import { GPUParticleRenderer } from "./renderer";
+import { scene, camera, controls, renderer, setBoundsSize } from "./scene";
 
 async function bootstrap() {
   const gpuCanvas = document.createElement("canvas");
@@ -32,18 +27,21 @@ async function bootstrap() {
     simulation.getParticlesBuffer(),
   );
 
-  const viewProj = new THREE.Matrix4();
-  const viewProjArray = new Float32Array(16);
+  const viewMatrixArray = new Float32Array(16);
+  const projMatrixArray = new Float32Array(16);
 
   setupGUI(
     () => simulation.updateParticleCount(),
-    () => setBoundsSize(config.boundsWidth, config.boundsHeight),
-    (dist: number) => setCameraDistance(dist),
+    () =>
+      setBoundsSize(
+        config.boundsWidth,
+        config.boundsHeight,
+        config.boundsDepth,
+      ),
     () => {},
   );
 
-  setBoundsSize(config.boundsWidth, config.boundsHeight);
-  setCameraDistance(config.cameraDistance);
+  setBoundsSize(config.boundsWidth, config.boundsHeight, config.boundsDepth);
 
   window.addEventListener("resize", () => {
     const width = window.innerWidth;
@@ -55,84 +53,120 @@ async function bootstrap() {
 
     gpuCanvas.width = width * dpr;
     gpuCanvas.height = height * dpr;
+    gpuRenderer.resize(gpuCanvas.width, gpuCanvas.height);
 
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
   });
 
-  let mouseButton: number | null = null;
   const mouse = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
-  const simulationPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-  const mouseWorld3D = new THREE.Vector3();
-  const mouseWorld = new THREE.Vector2();
 
-  function updatePointer(e: PointerEvent) {
+  let isInteracting = false;
+  let interactionMode: "push" | "pull" | null = null;
+
+  function updateRaycast(e: MouseEvent) {
     const rect = renderer.domElement.getBoundingClientRect();
     mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
     raycaster.setFromCamera(mouse, camera);
-    raycaster.ray.intersectPlane(simulationPlane, mouseWorld3D);
-    mouseWorld.set(mouseWorld3D.x, mouseWorld3D.y);
+
+    if (isInteracting && interactionMode) {
+      const strength =
+        interactionMode === "push"
+          ? config.interactionStrength
+          : -config.interactionStrength;
+      simulation.setInteraction(
+        raycaster.ray.origin,
+        raycaster.ray.direction,
+        strength,
+      );
+    }
   }
 
-  window.addEventListener("contextmenu", (e) => e.preventDefault());
+  renderer.domElement.addEventListener("contextmenu", (e) =>
+    e.preventDefault(),
+  );
 
-  window.addEventListener("pointerdown", (e) => {
-    mouseButton = e.button;
-    updatePointer(e);
-    if (mouseButton === 0)
-      simulation.setInteraction(mouseWorld, -config.interactionStrength);
-    if (mouseButton === 2)
-      simulation.setInteraction(mouseWorld, config.interactionStrength);
+  renderer.domElement.addEventListener("mousedown", (e) => {
+    if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
+      controls.enabled = false;
+      isInteracting = true;
+      interactionMode = "push";
+      updateRaycast(e);
+    } else if (e.button === 1 || (e.button === 0 && e.ctrlKey)) {
+      controls.enabled = false;
+      isInteracting = true;
+      interactionMode = "pull";
+      updateRaycast(e);
+    }
   });
 
-  window.addEventListener("pointermove", (e) => {
-    updatePointer(e);
-    if (mouseButton === 0)
-      simulation.setInteraction(mouseWorld, -config.interactionStrength);
-    if (mouseButton === 2)
-      simulation.setInteraction(mouseWorld, config.interactionStrength);
+  window.addEventListener("mousemove", (e) => {
+    if (isInteracting) updateRaycast(e);
   });
 
-  window.addEventListener("pointerup", () => {
-    mouseButton = null;
-    simulation.setInteraction(mouseWorld, 0);
+  window.addEventListener("mouseup", () => {
+    if (isInteracting) {
+      isInteracting = false;
+      interactionMode = null;
+      controls.enabled = true;
+      simulation.setInteraction(new THREE.Vector3(), new THREE.Vector3(), 0);
+    }
   });
 
+  let stepOnce = false;
   window.addEventListener("keydown", (e) => {
     if (e.code === "Space") config.paused = !config.paused;
     if (e.code === "KeyR") simulation.initParticleGrid();
+    if (e.code === "Period") {
+      config.paused = true;
+      stepOnce = true;
+    }
   });
 
+  let accumulator = 0;
   const timer = new THREE.Timer();
   const FIXED_DELTA = 1 / 60;
-  let accumulator = 0;
+
+  const cameraRight = new THREE.Vector3();
+  const cameraUp = new THREE.Vector3();
 
   function animate(timestamp: number) {
     timer.update(timestamp);
     accumulator += Math.min(timer.getDelta(), 0.1);
 
+    controls.update();
+
     camera.updateMatrixWorld();
+    camera.matrixWorld.extractBasis(cameraRight, cameraUp, new THREE.Vector3());
     camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
-    viewProj.multiplyMatrices(
-      camera.projectionMatrix,
-      camera.matrixWorldInverse,
-    );
-    viewProj.toArray(viewProjArray);
+    camera.matrixWorldInverse.toArray(viewMatrixArray);
+    camera.projectionMatrix.toArray(projMatrixArray);
 
     const commandEncoder = simulation.getDevice().createCommandEncoder();
-    while (accumulator >= FIXED_DELTA) {
-      simulation.recordStepCommands(commandEncoder, FIXED_DELTA);
-      accumulator -= FIXED_DELTA;
+    if (stepOnce) {
+      simulation.recordStepCommands(commandEncoder, FIXED_DELTA, true);
+      stepOnce = false;
+    } else {
+      while (accumulator >= FIXED_DELTA) {
+        simulation.recordStepCommands(commandEncoder, FIXED_DELTA);
+        accumulator -= FIXED_DELTA;
+      }
     }
 
     renderer.render(scene, camera);
 
-    gpuRenderer.render(commandEncoder, viewProjArray, config.numParticles);
-    simulation.getDevice().queue.submit([commandEncoder.finish()]);
+    gpuRenderer.render(
+      commandEncoder,
+      viewMatrixArray,
+      projMatrixArray,
+      [cameraRight.x, cameraRight.y, cameraRight.z],
+      [cameraUp.x, cameraUp.y, cameraUp.z],
+      config.numParticles,
+    );
 
+    simulation.getDevice().queue.submit([commandEncoder.finish()]);
     requestAnimationFrame(animate);
   }
 
