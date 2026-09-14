@@ -37,12 +37,19 @@ struct SimParams {
   viscosityStrength: f32, smoothingRadius: f32, particleMass: f32, particleRadius: f32,
   deltaTime: f32, numParticles: u32, tableSize: u32, interactionRadius: f32,
   interactionStrength: f32, poly6Factor: f32, spikyGradFactor: f32, nearSpikyGradFactor: f32,
-  viscFactor: f32, numColliders: u32, _pad1: f32, _pad2: f32,
+  viscFactor: f32, numColliders: u32, numProbes: u32, _pad2: f32,
   interactionRayOrigin: vec4<f32>,
   interactionRayDir: vec4<f32>,
 };
 
 struct BitonicParams { k: u32, j: u32, numEntries: u32, _pad: u32 };
+
+struct ProbeSample {
+  density: f32,
+  velX: f32,
+  velY: f32,
+  velZ: f32,
+};
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
@@ -50,6 +57,8 @@ struct BitonicParams { k: u32, j: u32, numEntries: u32, _pad: u32 };
 @group(0) @binding(3) var<storage, read_write> startIndices: array<u32>;
 @group(0) @binding(4) var<storage, read> colliders: array<Collider>;
 @group(0) @binding(5) var<storage, read> sdfData: array<f32>;
+@group(0) @binding(6) var<storage, read> probePositions: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> probeSamples: array<ProbeSample>;
 
 @group(1) @binding(0) var<uniform> bitonicParams: BitonicParams;
 
@@ -551,5 +560,58 @@ fn integratePositions(@builtin(global_invocation_id) id: vec3<u32>) {
 
   particles[index].position = vec4<f32>(pos, 1.0);
   particles[index].velocity = vec4<f32>(vel, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn sampleProbes(@builtin(global_invocation_id) id: vec3<u32>) {
+  let idx = id.x;
+  if (idx >= params.numProbes) { return; }
+
+  let pos = probePositions[idx].xyz;
+  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
+  let radius = params.smoothingRadius;
+  let radiusSqr = radius * radius;
+
+  var density = 0.0;
+  var weightedVel = vec3<f32>(0.0);
+  var weightSum = 0.0;
+
+  for (var oz = -1; oz <= 1; oz++) {
+    for (var oy = -1; oy <= 1; oy++) {
+      for (var ox = -1; ox <= 1; ox++) {
+        let neighborCell = centerCell + vec3<i32>(ox, oy, oz);
+        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
+        let startIndex = startIndices[key];
+        if (startIndex == 0xFFFFFFFFu) { continue; }
+
+        for (var i = startIndex; i < params.numParticles; i++) {
+          let entry = spatialLookup[i];
+          if (entry.cellKey != key) { break; }
+
+          let nIdx = entry.particleIndex;
+          let nPos = particles[nIdx].predictedPosition.xyz;
+          let diff = nPos - pos;
+          let d2 = dot(diff, diff);
+          if (d2 <= radiusSqr) {
+            let d = sqrt(d2);
+            let w = densityKernel(radius, d) * params.particleMass;
+            density += w;
+            weightedVel += particles[nIdx].velocity.xyz * w;
+            weightSum += w;
+          }
+        }
+      }
+    }
+  }
+
+  var s: ProbeSample;
+  s.density = density;
+
+  let vel = select(vec3<f32>(0.0), weightedVel / weightSum, weightSum > 0.0001);
+  s.velX = vel.x;
+  s.velY = vel.y;
+  s.velZ = vel.z;
+
+  probeSamples[idx] = s;
 }
 `;

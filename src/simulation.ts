@@ -2,7 +2,7 @@ import * as THREE from "three";
 
 import { config } from "./config";
 import { fluidComputeShaderWGSL } from "./shader/fluidCompute.wgsl";
-import { GPUShaderStage, GPUBufferUsage } from "./types";
+import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
 import { bakeSignedDistanceFieldAsync } from "./sdfBaker";
 
 interface BitonicStep {
@@ -34,6 +34,9 @@ const MAX_COLLIDERS = 9;
 const FLOATS_PER_COLLIDER = 24;
 const SDF_BUFFER_FLOATS = 3_000_000;
 
+const MAX_PROBES = 128;
+const PROBE_BYTES = 16;
+
 const COMPUTE_ENTRY_POINTS = [
   "externalForces",
   "updateSpatialHash",
@@ -43,6 +46,7 @@ const COMPUTE_ENTRY_POINTS = [
   "calculateDensities",
   "calculateForces",
   "integratePositions",
+  "sampleProbes",
 ] as const;
 
 type ComputeEntryPoint = (typeof COMPUTE_ENTRY_POINTS)[number];
@@ -72,6 +76,15 @@ export class FluidSimulationGPU {
   private sdfCursor = 0;
   private meshBakeCache = new Map<string, BakedMeshHandle>();
   private meshBakePromises = new Map<string, Promise<BakedMeshHandle>>();
+
+  private probeInputBuffer!: GPUBuffer;
+  private probeOutputBuffer!: GPUBuffer;
+  private probeReadbackBuffer!: GPUBuffer;
+
+  private probeHasFreshData = false;
+  private probeMapInFlight = false;
+  private probeCount = 0;
+  private latestProbes: Float32Array | null = null;
 
   private pipelines: Record<ComputeEntryPoint, GPUComputePipeline> =
     {} as never;
@@ -149,6 +162,16 @@ export class FluidSimulationGPU {
           visibility: GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 7,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
       ],
     });
 
@@ -189,18 +212,22 @@ export class FluidSimulationGPU {
     this.particlesBuffer = this.createBuffer(
       this.maxPaddedCount * 64,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "particles",
     );
     this.spatialLookupBuffer = this.createBuffer(
       this.maxPaddedCount * 8,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "spatialLookup",
     );
     this.startIndicesBuffer = this.createBuffer(
       this.maxPaddedCount * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "startIndices",
     );
     this.simParamsBuffer = this.createBuffer(
       160,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      "simParams",
     );
 
     const maxBitonicPasses =
@@ -209,16 +236,35 @@ export class FluidSimulationGPU {
     this.bitonicParamsBuffer = this.createBuffer(
       Math.max(256, maxBitonicPasses * this.uniformAlignment),
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      "bitonicParams",
     );
 
     this.collidersBuffer = this.createBuffer(
       MAX_COLLIDERS * FLOATS_PER_COLLIDER * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "colliders",
     );
 
     this.sdfDataBuffer = this.createBuffer(
       SDF_BUFFER_FLOATS * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "sdfData",
+    );
+
+    this.probeInputBuffer = this.createBuffer(
+      MAX_PROBES * PROBE_BYTES,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "probeInput",
+    );
+    this.probeOutputBuffer = this.createBuffer(
+      MAX_PROBES * PROBE_BYTES,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      "probeOutput",
+    );
+    this.probeReadbackBuffer = this.createBuffer(
+      MAX_PROBES * PROBE_BYTES,
+      GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      "probeReadback",
     );
 
     this.mainBindGroup = this.device.createBindGroup({
@@ -230,6 +276,8 @@ export class FluidSimulationGPU {
         { binding: 3, resource: { buffer: this.startIndicesBuffer } },
         { binding: 4, resource: { buffer: this.collidersBuffer } },
         { binding: 5, resource: { buffer: this.sdfDataBuffer } },
+        { binding: 6, resource: { buffer: this.probeInputBuffer } },
+        { binding: 7, resource: { buffer: this.probeOutputBuffer } },
       ],
     });
 
@@ -243,8 +291,16 @@ export class FluidSimulationGPU {
       ],
     });
   }
-  private createBuffer(size: number, usage: GPUBufferUsageFlags): GPUBuffer {
-    return this.device.createBuffer({ size, usage });
+  private createBuffer(
+    size: number,
+    usage: GPUBufferUsageFlags,
+    label?: string,
+  ): GPUBuffer {
+    return this.device.createBuffer({
+      label,
+      size,
+      usage,
+    });
   }
   public updateParticleCount(): void {
     this.paddedParticlesCount = this.nextPowerOfTwo(config.numParticles);
@@ -344,6 +400,9 @@ export class FluidSimulationGPU {
   public setBoundsRotation(quaternion: THREE.Quaternion): void {
     this.boundsQuaternion.copy(quaternion);
   }
+  public getBoundsQuaternion(): THREE.Quaternion {
+    return this.boundsQuaternion;
+  }
   public setObjects(objects: ObjectDescriptor[]): void {
     this.objects = objects.slice(0, MAX_COLLIDERS - 1);
   }
@@ -361,6 +420,48 @@ export class FluidSimulationGPU {
   }
   public getParticlesBuffer(): GPUBuffer {
     return this.particlesBuffer;
+  }
+  public setProbes(positions: Float32Array, count: number): void {
+    this.probeCount = Math.min(count, MAX_PROBES);
+    if (this.probeCount === 0) return;
+    this.device.queue.writeBuffer(
+      this.probeInputBuffer,
+      0,
+      positions,
+      0,
+      this.probeCount * 4,
+    );
+  }
+  public getLatestProbes(): Float32Array | null {
+    return this.latestProbes;
+  }
+  public pollProbeResults(): void {
+    if (this.probeCount === 0) return;
+    if (this.probeMapInFlight) return;
+    if (!this.probeHasFreshData) return;
+
+    const byteCount = this.probeCount * PROBE_BYTES;
+
+    this.probeHasFreshData = false;
+    this.probeMapInFlight = true;
+
+    this.probeReadbackBuffer
+      .mapAsync(GPUMapMode.READ, 0, byteCount)
+      .then(() => {
+        const mapped = this.probeReadbackBuffer.getMappedRange(0, byteCount);
+
+        this.latestProbes = new Float32Array(mapped).slice();
+        this.probeReadbackBuffer.unmap();
+        this.probeMapInFlight = false;
+      })
+      .catch((err) => {
+        console.warn("Probe readback failed:", err);
+
+        try {
+          this.probeReadbackBuffer.unmap();
+        } catch {}
+        this.probeMapInFlight = false;
+      });
   }
   public bakeMesh(
     geometry: THREE.BufferGeometry,
@@ -562,8 +663,8 @@ export class FluidSimulationGPU {
 
     f32[20] = 45 / (Math.PI * r6);
     u32[21] = this.numColliders;
-    f32[22] = 0;
-    f32[23] = 0;
+    u32[22] = this.probeCount;
+    f32[23] = config.xsphStrength;
 
     f32[24] = this.rayOrigin.x;
     f32[25] = this.rayOrigin.y;
@@ -587,7 +688,6 @@ export class FluidSimulationGPU {
     const substeps = Math.max(1, config.substeps);
     const subDelta = deltaTime / substeps;
     const workgroupCount = Math.ceil(this.paddedParticlesCount / 256);
-
     for (let step = 0; step < substeps; step++) {
       this.updateUniforms(subDelta);
 
@@ -624,6 +724,25 @@ export class FluidSimulationGPU {
       pass.dispatchWorkgroups(workgroupCount);
 
       pass.end();
+    }
+
+    if (this.probeCount > 0) {
+      const pass = commandEncoder.beginComputePass();
+      pass.setBindGroup(0, this.mainBindGroup);
+      pass.setPipeline(this.pipelines.sampleProbes);
+      pass.dispatchWorkgroups(Math.ceil(this.probeCount / 64));
+      pass.end();
+
+      if (!this.probeMapInFlight) {
+        commandEncoder.copyBufferToBuffer(
+          this.probeOutputBuffer,
+          0,
+          this.probeReadbackBuffer,
+          0,
+          this.probeCount * PROBE_BYTES,
+        );
+        this.probeHasFreshData = true;
+      }
     }
   }
 }

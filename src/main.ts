@@ -42,7 +42,15 @@ async function bootstrap(): Promise<void> {
     () => {},
     () => {},
     (index) => updaters.requestBakeForSlot(index),
+    (index) => updaters.spawnObject(index),
   );
+
+  for (let i = 0; i < config.objects.length; i++) {
+    if (config.objects[i].physics && config.objects[i].type !== "none") {
+      updaters.requestBakeForSlot(i);
+      updaters.spawnObject(i);
+    }
+  }
 
   const viewState = createViewState();
   const interaction = setupInteraction({
@@ -84,6 +92,8 @@ async function bootstrap(): Promise<void> {
 
     const frameDelta = Math.min(timer.getDelta(), 0.1);
     accumulator += frameDelta;
+
+    simulation.pollProbeResults();
 
     updaters.updateBoundsRotation(frameDelta);
     updaters.updateObjects(frameDelta);

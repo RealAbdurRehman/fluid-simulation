@@ -59,12 +59,17 @@ export interface ObjectSlotConfig {
   posX: number;
   posY: number;
   posZ: number;
-  rotX: number; // degrees
-  rotY: number; // degrees
-  rotZ: number; // degrees
+  rotX: number;
+  rotY: number;
+  rotZ: number;
   size: number;
   autoSpin: boolean;
-  spinSpeed: number; // deg/s
+  spinSpeed: number;
+
+  physics: boolean;
+  densityRatio: number;
+  drag: number;
+  angularDrag: number;
 }
 
 function makeObjectSlot(
@@ -81,6 +86,10 @@ function makeObjectSlot(
     size: 1.5,
     autoSpin: false,
     spinSpeed: 30,
+    physics: false,
+    densityRatio: 0.5,
+    drag: 8.0,
+    angularDrag: 4.0,
     ...overrides,
   };
 }
@@ -103,6 +112,7 @@ export const config = {
   maxParticles: 42768,
   particleSize: 0.22,
   particleSpacing: 0.04,
+  xsphStrength: 0.15,
 
   boundsWidth: 14,
   boundsHeight: 14,
@@ -129,6 +139,7 @@ export function setupGUI(
   onUpdateBounds: () => void,
   onUpdateParticleSize: (size: number) => void,
   onObjectChanged: (index: number) => void,
+  onSpawnObject: (index: number) => void,
 ): GUI {
   const gui = new GUI({ title: "Fluid Simulation" });
 
@@ -137,7 +148,7 @@ export function setupGUI(
   addContainerFolder(gui, onUpdateBounds);
   addSPHFolder(gui);
   addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
-  addObjectFolders(gui, onObjectChanged);
+  addObjectFolders(gui, onObjectChanged, onSpawnObject);
   addVisualsFolder(gui);
 
   return gui;
@@ -233,6 +244,7 @@ function addParticleFolder(
 function addObjectFolders(
   gui: GUI,
   onObjectChanged: (index: number) => void,
+  onSpawnObject: (index: number) => void,
 ): void {
   config.objects.forEach((slot, index) => {
     const folder = gui.addFolder(`Object ${index + 1}`);
@@ -249,6 +261,17 @@ function addObjectFolders(
     folder.add(slot, "rotZ", -180, 180, 1).name("Rotation Z");
     folder.add(slot, "autoSpin").name("Rotate");
     folder.add(slot, "spinSpeed", 0, 180, 1).name("Rotation Speed");
+
+    folder
+      .add(slot, "physics")
+      .name("Physics")
+      .onChange(() => onObjectChanged(index));
+    folder
+      .add(slot, "densityRatio", 0.05, 4.0, 0.05)
+      .name("Density (rel. fluid)");
+    folder.add(slot, "drag", 0, 20, 0.1).name("Drag");
+    folder.add(slot, "angularDrag", 0, 20, 0.1).name("Angular Drag");
+    folder.add({ spawn: () => onSpawnObject(index) }, "spawn").name("Spawn");
   });
 }
 
