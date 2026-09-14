@@ -52,6 +52,39 @@ export const PRESETS: Record<string, SimulationPreset> = {
   },
 };
 
+export type ObjectShapeType = "none" | "sphere" | "box" | "torusKnot";
+
+export interface ObjectSlotConfig {
+  type: ObjectShapeType;
+  posX: number;
+  posY: number;
+  posZ: number;
+  rotX: number; // degrees
+  rotY: number; // degrees
+  rotZ: number; // degrees
+  size: number;
+  autoSpin: boolean;
+  spinSpeed: number; // deg/s
+}
+
+function makeObjectSlot(
+  overrides: Partial<ObjectSlotConfig> = {},
+): ObjectSlotConfig {
+  return {
+    type: "none",
+    posX: 0,
+    posY: 0,
+    posZ: 0,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    size: 1.5,
+    autoSpin: false,
+    spinSpeed: 30,
+    ...overrides,
+  };
+}
+
 export const config = {
   preset: "Water",
 
@@ -75,6 +108,15 @@ export const config = {
   boundsHeight: 14,
   boundsDepth: 14,
 
+  boundsRotationX: 0,
+  boundsRotationY: 0,
+  boundsRotationZ: 0,
+  boundsAutoTumble: false,
+
+  objects: [
+    makeObjectSlot({ type: "none", posX: 3.5, size: 1.5 }),
+  ] as ObjectSlotConfig[],
+
   interactionRadius: 5.0,
   interactionStrength: 80.0,
 
@@ -86,85 +128,132 @@ export function setupGUI(
   onResetParticles: () => void,
   onUpdateBounds: () => void,
   onUpdateParticleSize: (size: number) => void,
+  onObjectChanged: (index: number) => void,
 ): GUI {
   const gui = new GUI({ title: "Fluid Simulation" });
 
-  const presetFolder = gui.addFolder("Presets");
-  presetFolder
+  addPresetFolder(gui, onResetParticles);
+  addSimulationFolder(gui);
+  addContainerFolder(gui, onUpdateBounds);
+  addSPHFolder(gui);
+  addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
+  addObjectFolders(gui, onObjectChanged);
+  addVisualsFolder(gui);
+
+  return gui;
+}
+
+function addPresetFolder(gui: GUI, onResetParticles: () => void): void {
+  const folder = gui.addFolder("Presets");
+  folder
     .add(config, "preset", Object.keys(PRESETS))
     .name("Load Preset")
-    .onChange((presetKey: string) => {
-      const p = PRESETS[presetKey];
+    .onChange((key: string) => {
+      const p = PRESETS[key];
       if (!p) return;
-      config.gravity = p.gravity;
-      config.collisionDamping = p.collisionDamping;
-      config.targetDensity = p.targetDensity;
-      config.pressureMultiplier = p.pressureMultiplier;
-      config.nearDensityMultiplier = p.nearDensityMultiplier;
-      config.smoothingRadius = p.smoothingRadius;
-      config.viscosityStrength = p.viscosityStrength;
-      config.particleSpacing = p.particleSpacing;
-      config.substeps = p.substeps;
+      Object.assign(config, {
+        gravity: p.gravity,
+        collisionDamping: p.collisionDamping,
+        targetDensity: p.targetDensity,
+        pressureMultiplier: p.pressureMultiplier,
+        nearDensityMultiplier: p.nearDensityMultiplier,
+        smoothingRadius: p.smoothingRadius,
+        viscosityStrength: p.viscosityStrength,
+        particleSpacing: p.particleSpacing,
+        substeps: p.substeps,
+      });
       gui.controllersRecursive().forEach((c) => c.updateDisplay());
       onResetParticles();
     });
+}
 
-  const simFolder = gui.addFolder("Simulation Engine");
-  simFolder.add(config, "paused").name("Paused").listen();
-  simFolder.add(config, "substeps", 1, 5, 1).name("Substeps");
-  simFolder.add(config, "gravity", -40, 40, 0.5).name("Gravity");
-  simFolder
-    .add(config, "collisionDamping", 0, 1, 0.05)
-    .name("Wall Restitution");
-  simFolder
+function addSimulationFolder(gui: GUI): void {
+  const folder = gui.addFolder("Simulation Engine");
+  folder.add(config, "paused").name("Paused").listen();
+  folder.add(config, "substeps", 1, 5, 1).name("Substeps");
+  folder.add(config, "gravity", -40, 40, 0.5).name("Gravity");
+  folder.add(config, "collisionDamping", 0, 1, 0.05).name("Wall Restitution");
+}
+
+function addContainerFolder(gui: GUI, onUpdateBounds: () => void): void {
+  const folder = gui.addFolder("Container");
+  folder.add(config, "boundsAutoTumble").name("Auto rotate");
+  folder.add(config, "boundsRotationX", -180, 180, 1).name("Tilt X");
+  folder.add(config, "boundsRotationY", -180, 180, 1).name("Tilt Y");
+  folder.add(config, "boundsRotationZ", -180, 180, 1).name("Tilt Z");
+  folder
     .add(config, "boundsWidth", 4, 40, 1)
-    .name("Bounds Width")
-    .onChange(() => onUpdateBounds());
-  simFolder
+    .name("Width")
+    .onChange(onUpdateBounds);
+  folder
     .add(config, "boundsHeight", 4, 40, 1)
-    .name("Bounds Height")
-    .onChange(() => onUpdateBounds());
-  simFolder
+    .name("Height")
+    .onChange(onUpdateBounds);
+  folder
     .add(config, "boundsDepth", 4, 40, 1)
-    .name("Bounds Depth")
-    .onChange(() => onUpdateBounds());
+    .name("Depth")
+    .onChange(onUpdateBounds);
+}
 
-  const sphFolder = gui.addFolder("SPH Parameters");
-  sphFolder.add(config, "targetDensity", 1, 30, 0.5).name("Target Density");
-  sphFolder
+function addSPHFolder(gui: GUI): void {
+  const folder = gui.addFolder("SPH Parameters");
+  folder.add(config, "targetDensity", 1, 30, 0.5).name("Target Density");
+  folder
     .add(config, "pressureMultiplier", 10, 300, 5)
     .name("Pressure Multiplier");
-  sphFolder
-    .add(config, "nearDensityMultiplier", 0, 200, 5)
-    .name("Near Pressure");
-  sphFolder
+  folder.add(config, "nearDensityMultiplier", 0, 200, 5).name("Near Pressure");
+  folder
     .add(config, "smoothingRadius", 0.3, 2.0, 0.02)
     .name("Smoothing Radius");
-  sphFolder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
+  folder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
+}
 
-  const particleFolder = gui.addFolder("Particle Configuration");
-  particleFolder
+function addParticleFolder(
+  gui: GUI,
+  onResetParticles: () => void,
+  onUpdateParticleSize: (size: number) => void,
+): void {
+  const folder = gui.addFolder("Particle Configuration");
+  folder
     .add(config, "numParticles", 256, config.maxParticles, 256)
     .name("Particle Count")
-    .onChange(() => onResetParticles());
-  particleFolder
+    .onChange(onResetParticles);
+  folder
     .add(config, "particleSize", 0.05, 0.6, 0.01)
     .name("Visual Radius")
-    .onChange((s: number) => onUpdateParticleSize(s));
-  particleFolder
+    .onChange(onUpdateParticleSize);
+  folder
     .add(config, "particleSpacing", 0.0, 0.2, 0.005)
     .name("Initial Spacing")
-    .onChange(() => onResetParticles());
-  particleFolder
-    .add(config, "interactionRadius", 1, 15, 0.5)
-    .name("Mouse Radius");
-  particleFolder
-    .add(config, "interactionStrength", 5, 300, 5)
-    .name("Mouse Strength");
+    .onChange(onResetParticles);
+  folder.add(config, "interactionRadius", 1, 15, 0.5).name("Mouse Radius");
+  folder.add(config, "interactionStrength", 5, 300, 5).name("Mouse Strength");
+}
 
-  const visualsFolder = gui.addFolder("Visuals");
-  visualsFolder.add(config, "minSpeed", 0, 10, 0.5).name("Color Min Speed");
-  visualsFolder.add(config, "maxSpeed", 2, 30, 0.5).name("Color Max Speed");
+function addObjectFolders(
+  gui: GUI,
+  onObjectChanged: (index: number) => void,
+): void {
+  config.objects.forEach((slot, index) => {
+    const folder = gui.addFolder(`Object ${index + 1}`);
+    folder
+      .add(slot, "type", ["none", "sphere", "box", "torusKnot"])
+      .name("Shape")
+      .onChange(() => onObjectChanged(index));
+    folder.add(slot, "size", 0.5, 4, 0.1).name("Size");
+    folder.add(slot, "posX", -24, 24, 0.1).name("Position X");
+    folder.add(slot, "posY", -24, 24, 0.1).name("Position Y");
+    folder.add(slot, "posZ", -24, 24, 0.1).name("Position Z");
+    folder.add(slot, "rotX", -180, 180, 1).name("Rotation X");
+    folder.add(slot, "rotY", -180, 180, 1).name("Rotation Y");
+    folder.add(slot, "rotZ", -180, 180, 1).name("Rotation Z");
+    folder.add(slot, "autoSpin").name("Rotate");
+    folder.add(slot, "spinSpeed", 0, 180, 1).name("Rotation Speed");
+  });
+}
 
-  return gui;
+function addVisualsFolder(gui: GUI): void {
+  const folder = gui.addFolder("Visuals");
+  folder.add(config, "minSpeed", 0, 10, 0.5).name("Color Min Speed");
+  folder.add(config, "maxSpeed", 2, 30, 0.5).name("Color Max Speed");
 }
