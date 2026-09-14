@@ -681,9 +681,8 @@ export class FluidSimulationGPU {
   public recordStepCommands(
     commandEncoder: GPUCommandEncoder,
     deltaTime: number,
-    force: boolean = false,
   ): void {
-    if (!this.isInitialized || (config.paused && !force)) return;
+    if (!this.isInitialized) return;
 
     const substeps = Math.max(1, config.substeps);
     const subDelta = deltaTime / substeps;

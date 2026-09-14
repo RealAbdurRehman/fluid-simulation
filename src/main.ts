@@ -95,24 +95,26 @@ async function bootstrap(): Promise<void> {
 
     simulation.pollProbeResults();
 
-    updaters.updateBoundsRotation(frameDelta);
-    updaters.updateObjects(frameDelta);
     controls.update();
-
     camera.updateMatrixWorld();
     viewState.update(camera);
 
     const encoder = device.createCommandEncoder();
 
     if (stepOnce) {
-      simulation.recordStepCommands(encoder, FIXED_DELTA, true);
       stepOnce = false;
-    } else {
+      accumulator = 0;
+      updaters.updateBoundsRotation(FIXED_DELTA);
+      updaters.updateObjects(FIXED_DELTA);
+      simulation.recordStepCommands(encoder, FIXED_DELTA);
+    } else if (!config.paused)
       while (accumulator >= FIXED_DELTA) {
-        simulation.recordStepCommands(encoder, FIXED_DELTA);
         accumulator -= FIXED_DELTA;
+        updaters.updateBoundsRotation(FIXED_DELTA);
+        updaters.updateObjects(FIXED_DELTA);
+        simulation.recordStepCommands(encoder, FIXED_DELTA);
       }
-    }
+    else accumulator = 0;
 
     sceneRenderer.updateFrame(viewState.viewProj, [
       camera.position.x,
