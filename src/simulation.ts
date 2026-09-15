@@ -4,6 +4,7 @@ import { config } from "./config";
 import { fluidComputeShaderWGSL } from "./shader/fluidCompute.wgsl";
 import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
 import { bakeSignedDistanceFieldAsync } from "./sdfBaker";
+import type { TerrainData } from "./terrain";
 
 interface BitonicStep {
   k: number;
@@ -33,6 +34,7 @@ const ZERO_VEC = new THREE.Vector3();
 const MAX_COLLIDERS = 9;
 const FLOATS_PER_COLLIDER = 24;
 const SDF_BUFFER_FLOATS = 3_000_000;
+const TERRAIN_MAX_RESOLUTION = 512;
 
 const MAX_PROBES = 128;
 const PROBE_BYTES = 16;
@@ -74,6 +76,10 @@ export class FluidSimulationGPU {
 
   private sdfDataBuffer!: GPUBuffer;
   private sdfCursor = 0;
+
+  private terrainBuffer!: GPUBuffer;
+  private terrainMeta = new Float32Array([0, 0, 0, 0]);
+
   private meshBakeCache = new Map<string, BakedMeshHandle>();
   private meshBakePromises = new Map<string, Promise<BakedMeshHandle>>();
 
@@ -172,6 +178,11 @@ export class FluidSimulationGPU {
           visibility: GPUShaderStage.COMPUTE,
           buffer: { type: "storage" },
         },
+        {
+          binding: 8,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
       ],
     });
 
@@ -225,7 +236,7 @@ export class FluidSimulationGPU {
       "startIndices",
     );
     this.simParamsBuffer = this.createBuffer(
-      160,
+      192,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       "simParams",
     );
@@ -249,6 +260,12 @@ export class FluidSimulationGPU {
       SDF_BUFFER_FLOATS * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       "sdfData",
+    );
+
+    this.terrainBuffer = this.createBuffer(
+      TERRAIN_MAX_RESOLUTION * TERRAIN_MAX_RESOLUTION * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "terrain",
     );
 
     this.probeInputBuffer = this.createBuffer(
@@ -278,6 +295,7 @@ export class FluidSimulationGPU {
         { binding: 5, resource: { buffer: this.sdfDataBuffer } },
         { binding: 6, resource: { buffer: this.probeInputBuffer } },
         { binding: 7, resource: { buffer: this.probeOutputBuffer } },
+        { binding: 8, resource: { buffer: this.terrainBuffer } },
       ],
     });
 
@@ -625,6 +643,31 @@ export class FluidSimulationGPU {
       d[o + 23] = mesh.dataOffset;
     } else for (let i = 16; i < 24; i++) d[o + i] = 0;
   }
+  public setTerrain(t: TerrainData | null): void {
+    if (!t) {
+      this.terrainMeta[3] = 0;
+      return;
+    }
+
+    const N = Math.min(t.resolution, TERRAIN_MAX_RESOLUTION);
+    if (t.resolution > TERRAIN_MAX_RESOLUTION)
+      console.warn(
+        `Terrain resolution ${t.resolution} exceeds max ${TERRAIN_MAX_RESOLUTION}, clamping.`,
+      );
+
+    this.device.queue.writeBuffer(
+      this.terrainBuffer,
+      0,
+      t.heights.buffer,
+      t.heights.byteOffset,
+      N * N * 4,
+    );
+
+    this.terrainMeta[0] = N;
+    this.terrainMeta[1] = t.extent;
+    this.terrainMeta[2] = t.heightScale;
+    this.terrainMeta[3] = 1;
+  }
   public updateUniforms(subDelta: number): void {
     this.writeColliders();
 
@@ -675,6 +718,11 @@ export class FluidSimulationGPU {
     f32[29] = this.rayDir.y;
     f32[30] = this.rayDir.z;
     f32[31] = 0.0;
+
+    f32[32] = this.terrainMeta[0];
+    f32[33] = this.terrainMeta[1];
+    f32[34] = this.terrainMeta[2];
+    f32[35] = this.terrainMeta[3];
 
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }

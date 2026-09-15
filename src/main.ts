@@ -7,6 +7,7 @@ import { SceneRenderer } from "./sceneRenderer";
 import { camera, attachControls, resizeCamera } from "./scene";
 import { MeshRegistry } from "./meshRegistry";
 import { createSimUpdaters } from "./simUpdaters";
+import { generateTerrain, terrainToGeometry } from "./terrain";
 
 async function bootstrap(): Promise<void> {
   const simulation = new FluidSimulationGPU();
@@ -37,13 +38,41 @@ async function bootstrap(): Promise<void> {
 
   const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
 
+  let terrainMeshCounter = 0;
+
+  function regenerateTerrain(): void {
+    if (!config.terrainEnabled) {
+      simulation.setTerrain(null);
+      sceneRenderer.setTerrainMesh(null);
+      return;
+    }
+
+    const baseY = -config.boundsHeight / 2;
+    const extent = config.boundsWidth * 0.95;
+    const data = generateTerrain(
+      config.terrainResolution,
+      extent,
+      config.terrainHeightScale,
+      config.terrainSeed,
+    );
+
+    simulation.setTerrain(data);
+
+    const id = `terrain_${terrainMeshCounter++}`;
+    meshRegistry.register(id, terrainToGeometry(data, baseY));
+    sceneRenderer.setTerrainMesh(id);
+  }
+
   setupGUI(
     () => simulation.updateParticleCount(),
-    () => {},
+    regenerateTerrain,
     () => {},
     (index) => updaters.requestBakeForSlot(index),
     (index) => updaters.spawnObject(index),
+    regenerateTerrain,
   );
+
+  regenerateTerrain();
 
   for (let i = 0; i < config.objects.length; i++) {
     if (config.objects[i].physics && config.objects[i].type !== "none") {

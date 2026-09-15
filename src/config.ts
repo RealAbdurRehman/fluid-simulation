@@ -132,6 +132,11 @@ export const config = {
 
   minSpeed: 0.0,
   maxSpeed: 12.0,
+
+  terrainEnabled: true,
+  terrainResolution: 128,
+  terrainHeightScale: 3.0,
+  terrainSeed: 1,
 };
 
 export function setupGUI(
@@ -140,6 +145,7 @@ export function setupGUI(
   onUpdateParticleSize: (size: number) => void,
   onObjectChanged: (index: number) => void,
   onSpawnObject: (index: number) => void,
+  onRegenerateTerrain: () => void,
 ): GUI {
   const gui = new GUI({ title: "Fluid Simulation" });
 
@@ -149,9 +155,34 @@ export function setupGUI(
   addSPHFolder(gui);
   addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
+  addTerrainFolder(gui, onRegenerateTerrain);
   addVisualsFolder(gui);
 
   return gui;
+}
+
+function addTerrainFolder(gui: GUI, onRegen: () => void): void {
+  const folder = gui.addFolder("Terrain");
+  folder.add(config, "terrainEnabled").name("Enabled").onChange(onRegen);
+  folder
+    .add(config, "terrainResolution", 32, 512, 32)
+    .name("Resolution")
+    .onChange(onRegen);
+  folder
+    .add(config, "terrainHeightScale", 0.5, 8, 0.1)
+    .name("Height Scale")
+    .onChange(onRegen);
+  folder
+    .add(
+      {
+        regen: () => {
+          config.terrainSeed = Math.floor(Math.random() * 100000);
+          onRegen();
+        },
+      },
+      "regen",
+    )
+    .name("Regenerate");
 }
 
 function addPresetFolder(gui: GUI, onResetParticles: () => void): void {

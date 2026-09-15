@@ -282,6 +282,8 @@ export class SceneRenderer {
 
   private objectVisuals: ObjectVisual[] = [];
   private boundsQuat: [number, number, number, number] = [0, 0, 0, 1];
+
+  private terrainMeshId: string | null = null;
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
     this.format = format;
@@ -297,6 +299,9 @@ export class SceneRenderer {
   }
   public setBoundsRotationQuat(q: [number, number, number, number]): void {
     this.boundsQuat = q;
+  }
+  public setTerrainMesh(id: string | null): void {
+    this.terrainMeshId = id;
   }
   public registerMesh(name: string, geometry: THREE.BufferGeometry): void {
     if (this.meshRegistry.has(name)) return;
@@ -595,13 +600,6 @@ export class SceneRenderer {
     const bh = config.boundsHeight;
     const bd = config.boundsDepth;
 
-    this.writeObject(
-      0,
-      [bw, bh, bd],
-      [0, 0, 0],
-      [0.0, 0.95, 1.0, 0.9],
-      this.boundsQuat,
-    );
     this.writeObject(1, [bw, 1, bd], [0, -bh / 2, 0], [0.03, 0.09, 0.18, 0.7]);
     this.writeObject(
       2,
@@ -620,6 +618,33 @@ export class SceneRenderer {
     }
 
     pass.setBindGroup(0, this.frameBindGroup);
+
+    if (this.terrainMeshId) {
+      const mesh = this.meshRegistry.get(this.terrainMeshId);
+      if (mesh) {
+        this.writeObject(
+          0,
+          [1, 1, 1],
+          [0, 0, 0],
+          [0.42, 0.32, 0.2, 1.0],
+          this.boundsQuat,
+        );
+
+        pass.setPipeline(this.meshPipeline);
+        pass.setBindGroup(1, this.objectBindGroup, [0]);
+        pass.setVertexBuffer(0, mesh.vertex);
+        pass.setIndexBuffer(mesh.index, "uint32");
+        pass.drawIndexed(mesh.indexCount);
+      }
+    }
+
+    this.writeObject(
+      0,
+      [bw, bh, bd],
+      [0, 0, 0],
+      [0.0, 0.95, 1.0, 0.9],
+      this.boundsQuat,
+    );
 
     pass.setPipeline(this.linePipeline);
     pass.setBindGroup(1, this.objectBindGroup, [2 * this.objectStride]);

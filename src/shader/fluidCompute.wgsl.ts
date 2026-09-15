@@ -40,6 +40,7 @@ struct SimParams {
   viscFactor: f32, numColliders: u32, numProbes: u32, _pad2: f32,
   interactionRayOrigin: vec4<f32>,
   interactionRayDir: vec4<f32>,
+  terrainMeta: vec4<f32>,
 };
 
 struct BitonicParams { k: u32, j: u32, numEntries: u32, _pad: u32 };
@@ -59,6 +60,7 @@ struct ProbeSample {
 @group(0) @binding(5) var<storage, read> sdfData: array<f32>;
 @group(0) @binding(6) var<storage, read> probePositions: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> probeSamples: array<ProbeSample>;
+@group(0) @binding(8) var<storage, read> terrain: array<f32>;
 
 @group(1) @binding(0) var<uniform> bitonicParams: BitonicParams;
 
@@ -438,7 +440,77 @@ fn resolveMesh(
   if (velAlongNormal < 0.0) {
     newRelVel -= q.worldNormal * velAlongNormal * (1.0 + restitution);
   }
+
   r.velocity = newRelVel + collider.velocity.xyz;
+  return r;
+}
+
+fn terrainHeightAt(x: f32, z: f32) -> f32 {
+  let N = i32(params.terrainMeta.x);
+  let ext = params.terrainMeta.y;
+  let hs = params.terrainMeta.z;
+  if (params.terrainMeta.w < 0.5 || N < 2) { return -1e9; }
+
+  let cell = ext / f32(N - 1);
+  let u = clamp((x + ext * 0.5) / cell, 0.0, f32(N - 1));
+  let v = clamp((z + ext * 0.5) / cell, 0.0, f32(N - 1));
+
+  let i0x = i32(floor(u));
+  let i0y = i32(floor(v));
+  let i1x = min(i0x + 1, N - 1);
+  let i1y = min(i0y + 1, N - 1);
+  let fx = u - f32(i0x);
+  let fy = v - f32(i0y);
+
+  let h00 = terrain[i0x + i0y * N];
+  let h10 = terrain[i1x + i0y * N];
+  let h01 = terrain[i0x + i1y * N];
+  let h11 = terrain[i1x + i1y * N];
+
+  let h = mix(mix(h00, h10, fx), mix(h01, h11, fx), fy);
+  return h * hs;
+}
+
+fn resolveTerrain(
+  posIn: vec3<f32>,
+  velIn: vec3<f32>,
+  radius: f32,
+) -> CollisionResult {
+  var r: CollisionResult;
+  r.position = posIn;
+  r.velocity = velIn;
+  if (params.terrainMeta.w < 0.5) { return r; }
+
+  let container = colliders[0];
+  let invRot = qConjugate(container.rotation);
+  var localPos = qRotateVec(invRot, posIn - container.data0.xyz);
+  var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
+
+  let baseY = -params.boundsHeight * 0.5;
+  let surfY = baseY + terrainHeightAt(localPos.x, localPos.z);
+
+  let cellSize = params.terrainMeta.y / max(params.terrainMeta.x - 1.0, 1.0);
+  let eps = max(cellSize, 0.01);
+  let dxH = terrainHeightAt(localPos.x + eps, localPos.z)
+          - terrainHeightAt(localPos.x - eps, localPos.z);
+  let dzH = terrainHeightAt(localPos.x, localPos.z + eps)
+          - terrainHeightAt(localPos.x, localPos.z - eps);
+  let n = normalize(vec3<f32>(-dxH, 2.0 * eps, -dzH));
+
+  let signedDist = localPos.y - surfY;
+  if (signedDist < radius) {
+    let push = radius - signedDist;
+    localPos += n * push;
+
+    let vn = dot(localVel, n);
+    if (vn < 0.0) {
+      let restitution = container.data2.w;
+      localVel -= n * vn * (1.0 + restitution);
+    }
+  }
+
+  r.position = qRotateVec(container.rotation, localPos) + container.data0.xyz;
+  r.velocity = qRotateVec(container.rotation, localVel) + container.velocity.xyz;
   return r;
 }
 
@@ -557,6 +629,10 @@ fn integratePositions(@builtin(global_invocation_id) id: vec3<u32>) {
     pos = result.position;
     vel = result.velocity;
   }
+
+  let tr = resolveTerrain(pos, vel, params.particleRadius);
+  pos = tr.position;
+  vel = tr.velocity;
 
   particles[index].position = vec4<f32>(pos, 1.0);
   particles[index].velocity = vec4<f32>(vel, 0.0);
