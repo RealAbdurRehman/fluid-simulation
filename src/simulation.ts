@@ -4,7 +4,7 @@ import { config } from "./config";
 import { fluidComputeShaderWGSL } from "./shader/fluidCompute.wgsl";
 import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
 import { bakeSignedDistanceFieldAsync } from "./sdfBaker";
-import type { TerrainData } from "./terrain";
+import { type PlanetData } from "./terrain";
 
 interface BitonicStep {
   k: number;
@@ -31,10 +31,13 @@ export interface ObjectDescriptor {
 const IDENTITY_QUAT = new THREE.Quaternion();
 const ZERO_VEC = new THREE.Vector3();
 
-const MAX_COLLIDERS = 9;
+const MAX_COLLIDERS = 10;
 const FLOATS_PER_COLLIDER = 24;
 const SDF_BUFFER_FLOATS = 3_000_000;
-const TERRAIN_MAX_RESOLUTION = 512;
+const PLANET_MAX_FACES = 6;
+const PLANET_MAX_FACE_RESOLUTION = 512;
+const PLANET_BUFFER_FLOATS =
+  PLANET_MAX_FACES * PLANET_MAX_FACE_RESOLUTION * PLANET_MAX_FACE_RESOLUTION;
 
 const MAX_PROBES = 128;
 const PROBE_BYTES = 16;
@@ -59,6 +62,7 @@ export class FluidSimulationGPU {
 
   private maxPaddedCount = 0;
   private paddedParticlesCount = 0;
+  private tableSize = 0;
   private bitonicSteps: BitonicStep[] = [];
   private uniformAlignment = 256;
 
@@ -71,17 +75,18 @@ export class FluidSimulationGPU {
   private collidersData = new Float32Array(MAX_COLLIDERS * FLOATS_PER_COLLIDER);
 
   private objects: ObjectDescriptor[] = [];
-  private numColliders = 1;
-  private boundsQuaternion = new THREE.Quaternion();
+  private numColliders = 0;
 
   private sdfDataBuffer!: GPUBuffer;
   private sdfCursor = 0;
-
-  private terrainBuffer!: GPUBuffer;
-  private terrainMeta = new Float32Array([0, 0, 0, 0]);
-
   private meshBakeCache = new Map<string, BakedMeshHandle>();
   private meshBakePromises = new Map<string, Promise<BakedMeshHandle>>();
+
+  private planetBuffer!: GPUBuffer;
+  private planetCenter = new THREE.Vector3(0, 0, 0);
+  private planetRadius = 20;
+  private planetHeightScale = 2.5;
+  private planetFaceResolution = 128;
 
   private probeInputBuffer!: GPUBuffer;
   private probeOutputBuffer!: GPUBuffer;
@@ -203,7 +208,6 @@ export class FluidSimulationGPU {
     const mainPipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [mainLayout],
     });
-
     const bitonicPipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [mainLayout, this.bitonicBindGroupLayout],
     });
@@ -219,6 +223,7 @@ export class FluidSimulationGPU {
   }
   private allocateFixedBuffers(): void {
     this.maxPaddedCount = this.nextPowerOfTwo(config.maxParticles);
+    this.tableSize = this.nextPowerOfTwo(this.maxPaddedCount * 2);
 
     this.particlesBuffer = this.createBuffer(
       this.maxPaddedCount * 64,
@@ -226,12 +231,12 @@ export class FluidSimulationGPU {
       "particles",
     );
     this.spatialLookupBuffer = this.createBuffer(
-      this.maxPaddedCount * 8,
+      this.tableSize * 8,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       "spatialLookup",
     );
     this.startIndicesBuffer = this.createBuffer(
-      this.maxPaddedCount * 4,
+      this.tableSize * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       "startIndices",
     );
@@ -262,10 +267,10 @@ export class FluidSimulationGPU {
       "sdfData",
     );
 
-    this.terrainBuffer = this.createBuffer(
-      TERRAIN_MAX_RESOLUTION * TERRAIN_MAX_RESOLUTION * 4,
+    this.planetBuffer = this.createBuffer(
+      PLANET_BUFFER_FLOATS * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      "terrain",
+      "planetHeights",
     );
 
     this.probeInputBuffer = this.createBuffer(
@@ -295,7 +300,7 @@ export class FluidSimulationGPU {
         { binding: 5, resource: { buffer: this.sdfDataBuffer } },
         { binding: 6, resource: { buffer: this.probeInputBuffer } },
         { binding: 7, resource: { buffer: this.probeOutputBuffer } },
-        { binding: 8, resource: { buffer: this.terrainBuffer } },
+        { binding: 8, resource: { buffer: this.planetBuffer } },
       ],
     });
 
@@ -314,11 +319,7 @@ export class FluidSimulationGPU {
     usage: GPUBufferUsageFlags,
     label?: string,
   ): GPUBuffer {
-    return this.device.createBuffer({
-      label,
-      size,
-      usage,
-    });
+    return this.device.createBuffer({ label, size, usage });
   }
   public updateParticleCount(): void {
     this.paddedParticlesCount = this.nextPowerOfTwo(config.numParticles);
@@ -351,78 +352,73 @@ export class FluidSimulationGPU {
     const n = config.numParticles;
     const initialData = new Float32Array(this.paddedParticlesCount * 16);
 
-    const margin = config.particleSize * 1.5;
-    const usableWidth = config.boundsWidth - margin * 2;
-    const usableHeight = config.boundsHeight - margin * 2;
-    const usableDepth = config.boundsDepth - margin * 2;
+    const R = this.planetRadius;
+    const hs = this.planetHeightScale;
 
     const perAxis = Math.max(1, Math.ceil(Math.cbrt(n)));
-    const countX = perAxis;
-    const countY = perAxis;
-    const countZ = perAxis;
+    const spacing = config.particleSize * 1.8 + config.particleSpacing;
+    const halfExtent = (perAxis - 1) * spacing * 0.5;
 
-    const baseSpacing = config.particleSize * 1.8 + config.particleSpacing;
-    const spacing = Math.min(
-      baseSpacing,
-      countX > 1 ? usableWidth / (countX - 1) : baseSpacing,
-      countY > 1 ? usableHeight / (countY - 1) : baseSpacing,
-      countZ > 1 ? usableDepth / (countZ - 1) : baseSpacing,
-    );
+    const D = new THREE.Vector3(0, 1, 0);
 
-    const gridWidthX = (countX - 1) * spacing;
-    const gridWidthZ = (countZ - 1) * spacing;
+    const upRef = new THREE.Vector3(0, 0, 1);
+    const T = new THREE.Vector3().crossVectors(upRef, D).normalize();
+    const B = new THREE.Vector3().crossVectors(D, T).normalize();
 
-    const startX = -gridWidthX / 2;
-    const startY = -config.boundsHeight / 2 + margin;
-    const startZ = -gridWidthZ / 2;
-
-    const halfBoundX = config.boundsWidth / 2 - margin;
-    const halfBoundY = config.boundsHeight / 2 - margin;
-    const halfBoundZ = config.boundsDepth / 2 - margin;
-
+    const centerAlt = R + hs + halfExtent + 1.5;
     for (let i = 0; i < n; i++) {
-      const xIdx = i % countX;
-      const zIdx = Math.floor(i / countX) % countZ;
-      const yIdx = Math.floor(i / (countX * countZ));
+      const ix = i % perAxis;
+      const iz = Math.floor(i / perAxis) % perAxis;
+      const iy = Math.floor(i / (perAxis * perAxis));
 
-      const x = THREE.MathUtils.clamp(
-        startX + xIdx * spacing,
-        -halfBoundX,
-        halfBoundX,
-      );
-      const y = THREE.MathUtils.clamp(
-        startY + yIdx * spacing,
-        -halfBoundY,
-        halfBoundY,
-      );
-      const z = THREE.MathUtils.clamp(
-        startZ + zIdx * spacing,
-        -halfBoundZ,
-        halfBoundZ,
-      );
+      const lx = ix * spacing - halfExtent;
+      const ly = iy * spacing - halfExtent;
+      const lz = iz * spacing - halfExtent;
+
+      const px =
+        this.planetCenter.x + D.x * (centerAlt + lz) + T.x * lx + B.x * ly;
+      const py =
+        this.planetCenter.y + D.y * (centerAlt + lz) + T.y * lx + B.y * ly;
+      const pz =
+        this.planetCenter.z + D.z * (centerAlt + lz) + T.z * lx + B.z * ly;
 
       const offset = i * 16;
-      initialData[offset + 0] = x;
-      initialData[offset + 1] = y;
-      initialData[offset + 2] = z;
+      initialData[offset + 0] = px;
+      initialData[offset + 1] = py;
+      initialData[offset + 2] = pz;
       initialData[offset + 3] = 1.0;
 
-      initialData[offset + 4] = x;
-      initialData[offset + 5] = y;
-      initialData[offset + 6] = z;
+      initialData[offset + 4] = px;
+      initialData[offset + 5] = py;
+      initialData[offset + 6] = pz;
       initialData[offset + 7] = 1.0;
     }
 
     this.device.queue.writeBuffer(this.particlesBuffer, 0, initialData);
   }
-  public setBoundsRotation(quaternion: THREE.Quaternion): void {
-    this.boundsQuaternion.copy(quaternion);
+  public setPlanet(planet: PlanetData): void {
+    const N = Math.min(planet.resolution, PLANET_MAX_FACE_RESOLUTION);
+    const floatCount = 6 * N * N;
+    if (floatCount > PLANET_BUFFER_FLOATS)
+      throw new Error("Planet face resolution exceeds buffer capacity.");
+
+    this.device.queue.writeBuffer(
+      this.planetBuffer,
+      0,
+      planet.heights.buffer,
+      planet.heights.byteOffset,
+      floatCount * 4,
+    );
+
+    this.planetRadius = planet.radius;
+    this.planetHeightScale = planet.heightScale;
+    this.planetFaceResolution = N;
   }
-  public getBoundsQuaternion(): THREE.Quaternion {
-    return this.boundsQuaternion;
+  public setPlanetCenter(c: THREE.Vector3): void {
+    this.planetCenter.copy(c);
   }
   public setObjects(objects: ObjectDescriptor[]): void {
-    this.objects = objects.slice(0, MAX_COLLIDERS - 1);
+    this.objects = objects.slice(0, MAX_COLLIDERS);
   }
   public setInteraction(
     rayOrigin: THREE.Vector3,
@@ -442,6 +438,7 @@ export class FluidSimulationGPU {
   public setProbes(positions: Float32Array, count: number): void {
     this.probeCount = Math.min(count, MAX_PROBES);
     if (this.probeCount === 0) return;
+
     this.device.queue.writeBuffer(
       this.probeInputBuffer,
       0,
@@ -459,7 +456,6 @@ export class FluidSimulationGPU {
     if (!this.probeHasFreshData) return;
 
     const byteCount = this.probeCount * PROBE_BYTES;
-
     this.probeHasFreshData = false;
     this.probeMapInFlight = true;
 
@@ -467,7 +463,6 @@ export class FluidSimulationGPU {
       .mapAsync(GPUMapMode.READ, 0, byteCount)
       .then(() => {
         const mapped = this.probeReadbackBuffer.getMappedRange(0, byteCount);
-
         this.latestProbes = new Float32Array(mapped).slice();
         this.probeReadbackBuffer.unmap();
         this.probeMapInFlight = false;
@@ -487,7 +482,6 @@ export class FluidSimulationGPU {
     padding = 0.5,
   ): Promise<BakedMeshHandle> {
     const key = `${geometry.uuid}:${resolution}:${padding}`;
-
     const cached = this.meshBakeCache.get(key);
     if (cached) return Promise.resolve(cached);
 
@@ -515,8 +509,6 @@ export class FluidSimulationGPU {
     key: string,
   ): Promise<BakedMeshHandle> {
     try {
-      console.log(`Baking SDF for mesh (resolution ${resolution})...`);
-      const t0 = performance.now();
       const baked = await bakeSignedDistanceFieldAsync(
         geometry,
         resolution,
@@ -524,13 +516,11 @@ export class FluidSimulationGPU {
       );
       const floatCount = baked.data.length;
 
-      if (this.sdfCursor + floatCount > SDF_BUFFER_FLOATS) {
+      if (this.sdfCursor + floatCount > SDF_BUFFER_FLOATS)
         throw new Error(
           `SDF data buffer exhausted (need ${floatCount} floats, ` +
-            `${SDF_BUFFER_FLOATS - this.sdfCursor} left). Lower the bake ` +
-            `resolution or increase SDF_BUFFER_FLOATS in simulation.ts.`,
+            `${SDF_BUFFER_FLOATS - this.sdfCursor} left).`,
         );
-      }
 
       const handle: BakedMeshHandle = {
         dataOffset: this.sdfCursor,
@@ -549,30 +539,14 @@ export class FluidSimulationGPU {
 
       this.sdfCursor += floatCount;
       this.meshBakeCache.set(key, handle);
-      console.log(
-        `SDF bake complete (${floatCount} cells, ${(performance.now() - t0).toFixed(0)}ms).`,
-      );
+
       return handle;
     } finally {
       this.meshBakePromises.delete(key);
     }
   }
   private writeColliders(): void {
-    this.packCollider(
-      0,
-      0,
-      ZERO_VEC,
-      this.boundsQuaternion,
-      new THREE.Vector3(
-        config.boundsWidth / 2,
-        config.boundsHeight / 2,
-        config.boundsDepth / 2,
-      ),
-      config.collisionDamping,
-      ZERO_VEC,
-    );
-
-    let count = 1;
+    let count = 0;
     for (const object of this.objects) {
       const shapeType =
         object.type === "sphere" ? 2 : object.type === "mesh" ? 3 : 1;
@@ -590,13 +564,15 @@ export class FluidSimulationGPU {
     }
 
     this.numColliders = count;
-    this.device.queue.writeBuffer(
-      this.collidersBuffer,
-      0,
-      this.collidersData,
-      0,
-      count * FLOATS_PER_COLLIDER,
-    );
+    if (count > 0) {
+      this.device.queue.writeBuffer(
+        this.collidersBuffer,
+        0,
+        this.collidersData,
+        0,
+        count * FLOATS_PER_COLLIDER,
+      );
+    }
   }
   private packCollider(
     index: number,
@@ -643,31 +619,6 @@ export class FluidSimulationGPU {
       d[o + 23] = mesh.dataOffset;
     } else for (let i = 16; i < 24; i++) d[o + i] = 0;
   }
-  public setTerrain(t: TerrainData | null): void {
-    if (!t) {
-      this.terrainMeta[3] = 0;
-      return;
-    }
-
-    const N = Math.min(t.resolution, TERRAIN_MAX_RESOLUTION);
-    if (t.resolution > TERRAIN_MAX_RESOLUTION)
-      console.warn(
-        `Terrain resolution ${t.resolution} exceeds max ${TERRAIN_MAX_RESOLUTION}, clamping.`,
-      );
-
-    this.device.queue.writeBuffer(
-      this.terrainBuffer,
-      0,
-      t.heights.buffer,
-      t.heights.byteOffset,
-      N * N * 4,
-    );
-
-    this.terrainMeta[0] = N;
-    this.terrainMeta[1] = t.extent;
-    this.terrainMeta[2] = t.heightScale;
-    this.terrainMeta[3] = 1;
-  }
   public updateUniforms(subDelta: number): void {
     this.writeColliders();
 
@@ -675,54 +626,54 @@ export class FluidSimulationGPU {
     const r6 = Math.pow(r, 6);
     const r9 = Math.pow(r, 9);
 
-    const buffer = new ArrayBuffer(160);
+    const buffer = new ArrayBuffer(192);
     const f32 = new Float32Array(buffer);
     const u32 = new Uint32Array(buffer);
 
-    f32[0] = config.boundsWidth;
-    f32[1] = config.boundsHeight;
-    f32[2] = config.boundsDepth;
-    f32[3] = config.gravity;
+    f32[0] = this.planetCenter.x;
+    f32[1] = this.planetCenter.y;
+    f32[2] = this.planetCenter.z;
+    f32[3] = 0.0;
 
-    f32[4] = config.collisionDamping;
-    f32[5] = config.targetDensity;
-    f32[6] = config.pressureMultiplier;
-    f32[7] = config.nearDensityMultiplier;
+    f32[4] = this.planetRadius;
+    f32[5] = this.planetHeightScale;
+    f32[6] = this.planetFaceResolution;
+    f32[7] = this.planetRadius + this.planetHeightScale * 6.0 + 20.0;
 
-    f32[8] = config.viscosityStrength;
-    f32[9] = config.smoothingRadius;
-    f32[10] = 1.0;
-    f32[11] = config.particleSize;
+    f32[8] = config.gravity;
+    f32[9] = config.collisionDamping;
+    f32[10] = config.targetDensity;
+    f32[11] = config.pressureMultiplier;
 
-    f32[12] = subDelta;
-    u32[13] = config.numParticles;
-    u32[14] = this.paddedParticlesCount;
-    f32[15] = config.interactionRadius;
+    f32[12] = config.nearDensityMultiplier;
+    f32[13] = config.viscosityStrength;
+    f32[14] = config.smoothingRadius;
+    f32[15] = 1.0;
 
-    f32[16] = this.interactionStrength;
-    f32[17] = 315 / (64 * Math.PI * r9);
-    f32[18] = 45 / (Math.PI * r6);
-    f32[19] = 45 / (Math.PI * r6);
+    f32[16] = config.particleSize;
+    f32[17] = subDelta;
+    u32[18] = config.numParticles;
+    u32[19] = this.tableSize;
 
-    f32[20] = 45 / (Math.PI * r6);
-    u32[21] = this.numColliders;
-    u32[22] = this.probeCount;
-    f32[23] = config.xsphStrength;
+    f32[20] = config.interactionRadius;
+    f32[21] = this.interactionStrength;
+    f32[22] = 315 / (64 * Math.PI * r9);
+    f32[23] = 45 / (Math.PI * r6);
 
-    f32[24] = this.rayOrigin.x;
-    f32[25] = this.rayOrigin.y;
-    f32[26] = this.rayOrigin.z;
-    f32[27] = 0.0;
+    f32[24] = 45 / (Math.PI * r6);
+    f32[25] = 45 / (Math.PI * r6);
+    u32[26] = this.numColliders;
+    u32[27] = this.probeCount;
 
-    f32[28] = this.rayDir.x;
-    f32[29] = this.rayDir.y;
-    f32[30] = this.rayDir.z;
+    f32[28] = this.rayOrigin.x;
+    f32[29] = this.rayOrigin.y;
+    f32[30] = this.rayOrigin.z;
     f32[31] = 0.0;
 
-    f32[32] = this.terrainMeta[0];
-    f32[33] = this.terrainMeta[1];
-    f32[34] = this.terrainMeta[2];
-    f32[35] = this.terrainMeta[3];
+    f32[32] = this.rayDir.x;
+    f32[33] = this.rayDir.y;
+    f32[34] = this.rayDir.z;
+    f32[35] = 0.0;
 
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }

@@ -32,15 +32,38 @@ struct MeshQuery {
 };
 
 struct SimParams {
-  boundsWidth: f32, boundsHeight: f32, boundsDepth: f32, gravity: f32,
-  collisionDamping: f32, targetDensity: f32, pressureMultiplier: f32, nearPressureMultiplier: f32,
-  viscosityStrength: f32, smoothingRadius: f32, particleMass: f32, particleRadius: f32,
-  deltaTime: f32, numParticles: u32, tableSize: u32, interactionRadius: f32,
-  interactionStrength: f32, poly6Factor: f32, spikyGradFactor: f32, nearSpikyGradFactor: f32,
-  viscFactor: f32, numColliders: u32, numProbes: u32, _pad2: f32,
+  planetCenter: vec4<f32>,     
+  planetParams: vec4<f32>,     
+
+  gravity: f32,
+  collisionDamping: f32,
+  targetDensity: f32,
+  pressureMultiplier: f32,
+
+  nearPressureMultiplier: f32,
+  viscosityStrength: f32,
+  smoothingRadius: f32,
+  particleMass: f32,
+
+  particleRadius: f32,
+  deltaTime: f32,
+  numParticles: u32,
+  tableSize: u32,
+
+  interactionRadius: f32,
+  interactionStrength: f32,
+  poly6Factor: f32,
+  spikyGradFactor: f32,
+
+  nearSpikyGradFactor: f32,
+  viscFactor: f32,
+  numColliders: u32,
+  numProbes: u32,
+
   interactionRayOrigin: vec4<f32>,
   interactionRayDir: vec4<f32>,
-  terrainMeta: vec4<f32>,
+  _pad0: vec4<f32>,
+  _pad1: vec4<f32>,
 };
 
 struct BitonicParams { k: u32, j: u32, numEntries: u32, _pad: u32 };
@@ -60,7 +83,7 @@ struct ProbeSample {
 @group(0) @binding(5) var<storage, read> sdfData: array<f32>;
 @group(0) @binding(6) var<storage, read> probePositions: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> probeSamples: array<ProbeSample>;
-@group(0) @binding(8) var<storage, read> terrain: array<f32>;
+@group(0) @binding(8) var<storage, read> planetHeights: array<f32>;
 
 @group(1) @binding(0) var<uniform> bitonicParams: BitonicParams;
 
@@ -88,91 +111,6 @@ fn hashCell(cell: vec3<i32>) -> u32 {
 
 fn getKeyFromHash(hash: u32, tableSize: u32) -> u32 {
   return hash % tableSize;
-}
-
-@compute @workgroup_size(256)
-fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.numParticles) { return; }
-
-  var vel = particles[index].velocity.xyz;
-  let pos = particles[index].position.xyz;
-
-  vel.y += -params.gravity * params.deltaTime;
-
-  if (params.interactionStrength != 0.0) {
-    let rayOrigin = params.interactionRayOrigin.xyz;
-    let rayDir = params.interactionRayDir.xyz;
-    let v = pos - rayOrigin;
-    let projDist = dot(v, rayDir);
-    let closestPointOnRay = rayOrigin + rayDir * max(0.0, projDist);
-
-    let offset = closestPointOnRay - pos;
-    let distSqr = dot(offset, offset);
-    let radiusSqr = params.interactionRadius * params.interactionRadius;
-
-    if (distSqr < radiusSqr && distSqr > 0.0001) {
-      let dist = sqrt(distSqr);
-      let dir = offset / dist;
-      let centerT = 1.0 - (dist / params.interactionRadius);
-      let force = (dir * params.interactionStrength - vel) * (centerT * centerT);
-      vel += force * params.deltaTime;
-    }
-  }
-
-  particles[index].velocity = vec4<f32>(vel, 0.0);
-  particles[index].predictedPosition = vec4<f32>(pos + vel * (1.0 / 60.0), 0.0);
-}
-
-@compute @workgroup_size(256)
-fn updateSpatialHash(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.tableSize) { return; }
-
-  if (index < params.numParticles) {
-    let cellCoord = positionToCellCoord(particles[index].predictedPosition.xyz, params.smoothingRadius);
-    let key = getKeyFromHash(hashCell(cellCoord), params.tableSize);
-    spatialLookup[index] = SpatialEntry(index, key);
-  } else {
-    spatialLookup[index] = SpatialEntry(0xFFFFFFFFu, 0xFFFFFFFFu);
-  }
-}
-
-@compute @workgroup_size(256)
-fn bitonicSort(@builtin(global_invocation_id) id: vec3<u32>) {
-  let i = id.x;
-  if (i >= bitonicParams.numEntries) { return; }
-
-  let k = bitonicParams.k;
-  let j = bitonicParams.j;
-
-  let l = i ^ j;
-  if (l > i && l < bitonicParams.numEntries) {
-    let ascending = (i & k) == 0u;
-    let entryA = spatialLookup[i];
-    let entryB = spatialLookup[l];
-
-    if ((entryA.cellKey > entryB.cellKey) == ascending) {
-      spatialLookup[i] = entryB;
-      spatialLookup[l] = entryA;
-    }
-  }
-}
-
-@compute @workgroup_size(256)
-fn clearStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index < params.tableSize) { startIndices[index] = 0xFFFFFFFFu; }
-}
-
-@compute @workgroup_size(256)
-fn calculateStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.numParticles) { return; }
-
-  let key = spatialLookup[index].cellKey;
-  let prevKey = select(spatialLookup[index - 1u].cellKey, 0xFFFFFFFFu, index == 0u);
-  if (key != prevKey && key < params.tableSize) { startIndices[key] = index; }
 }
 
 fn densityKernel(radius: f32, dist: f32) -> f32 {
@@ -212,83 +150,85 @@ fn viscosityKernel(radius: f32, dist: f32) -> f32 {
   return v * v * params.viscFactor;
 }
 
-@compute @workgroup_size(256)
-fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.numParticles) { return; }
+fn dirToFaceUV(d: vec3<f32>) -> vec3<f32> {
+  let a = abs(d);
+  var face: f32;
+  var s: f32;
+  var t: f32;
 
-  let pos = particles[index].predictedPosition.xyz;
-  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
-  let radius = params.smoothingRadius;
-  let radiusSqr = radius * radius;
-
-  var density = 0.0;
-  var nearDensity = 0.0;
-
-  for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
-    for (var offsetY = -1; offsetY <= 1; offsetY++) {
-      for (var offsetX = -1; offsetX <= 1; offsetX++) {
-        let neighborCell = centerCell + vec3<i32>(offsetX, offsetY, offsetZ);
-        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
-        let startIndex = startIndices[key];
-
-        if (startIndex != 0xFFFFFFFFu) {
-          for (var i = startIndex; i < params.numParticles; i++) {
-            let entry = spatialLookup[i];
-            if (entry.cellKey != key) { break; }
-
-            let neighborIndex = entry.particleIndex;
-            let neighborPos = particles[neighborIndex].predictedPosition.xyz;
-            let diff = neighborPos - pos;
-            let distSqr = dot(diff, diff);
-
-            if (distSqr <= radiusSqr) {
-              let dist = sqrt(distSqr);
-              density += params.particleMass * densityKernel(radius, dist);
-              nearDensity += params.particleMass * nearDensityKernel(radius, dist);
-            }
-          }
-        }
-      }
-    }
+  if (a.x >= a.y && a.x >= a.z) {
+    if (d.x > 0.0) { face = 0.0; s = -d.z / a.x; t = -d.y / a.x; }
+    else           { face = 1.0; s =  d.z / a.x; t = -d.y / a.x; }
+  } else if (a.y >= a.z) {
+    if (d.y > 0.0) { face = 2.0; s = d.x / a.y; t =  d.z / a.y; }
+    else           { face = 3.0; s = d.x / a.y; t = -d.z / a.y; }
+  } else {
+    if (d.z > 0.0) { face = 4.0; s =  d.x / a.z; t = -d.y / a.z; }
+    else           { face = 5.0; s = -d.x / a.z; t = -d.y / a.z; }
   }
 
-  particles[index].density = vec4<f32>(density, nearDensity, 0.0, 0.0);
+  return vec3<f32>(face, (s + 1.0) * 0.5, (t + 1.0) * 0.5);
 }
 
-fn containerRepulsionForce(pos: vec3<f32>, radius: f32) -> vec3<f32> {
-  let container = colliders[0];
-  let invRot = qConjugate(container.rotation);
-  let localPos = qRotateVec(invRot, pos - container.data0.xyz);
-  let halfExtents = container.data2.xyz - vec3<f32>(radius);
-  let margin = radius;
+fn samplePlanetHeight(dir: vec3<f32>) -> f32 {
+  let N = i32(params.planetParams.z);
+  let fuv = dirToFaceUV(dir);
+  let face = i32(fuv.x);
 
-  var localForce = vec3<f32>(0.0);
-  let dx = halfExtents.x - abs(localPos.x);
-  if (dx < margin) { localForce.x += -sign(localPos.x) * (margin - dx) / margin; }
-  let dy = halfExtents.y - abs(localPos.y);
-  if (dy < margin) { localForce.y += -sign(localPos.y) * (margin - dy) / margin; }
-  let dz = halfExtents.z - abs(localPos.z);
-  if (dz < margin) { localForce.z += -sign(localPos.z) * (margin - dz) / margin; }
+  let uu = clamp(fuv.y, 0.0, 1.0) * f32(N - 1);
+  let vv = clamp(fuv.z, 0.0, 1.0) * f32(N - 1);
 
-  return qRotateVec(container.rotation, localForce) * params.pressureMultiplier;
+  let i0 = vec2<i32>(i32(floor(uu)), i32(floor(vv)));
+  let i1 = vec2<i32>(min(i0.x + 1, N - 1), min(i0.y + 1, N - 1));
+  let f = vec2<f32>(uu - floor(uu), vv - floor(vv));
+
+  let base = face * N * N;
+  let h00 = planetHeights[base + i0.y * N + i0.x];
+  let h10 = planetHeights[base + i0.y * N + i1.x];
+  let h01 = planetHeights[base + i1.y * N + i0.x];
+  let h11 = planetHeights[base + i1.y * N + i1.x];
+
+  let top = mix(h00, h10, f.x);
+  let bot = mix(h01, h11, f.x);
+
+  return mix(top, bot, f.y);
 }
 
-fn resolveContainer(posIn: vec3<f32>, velIn: vec3<f32>, collider: Collider, radius: f32) -> CollisionResult {
-  let invRot = qConjugate(collider.rotation);
-  var localPos = qRotateVec(invRot, posIn - collider.data0.xyz);
-  var localVel = qRotateVec(invRot, velIn - collider.velocity.xyz);
-  let halfExtents = collider.data2.xyz - vec3<f32>(radius);
-  let restitution = collider.data2.w;
+fn samplePlanetPoint(dir: vec3<f32>) -> vec3<f32> {
+  let h = samplePlanetHeight(dir) * params.planetParams.y;
+  return params.planetCenter.xyz + dir * (params.planetParams.x + h);
+}
 
-  if (abs(localPos.x) > halfExtents.x) { localPos.x = sign(localPos.x) * halfExtents.x; localVel.x *= -restitution; }
-  if (abs(localPos.y) > halfExtents.y) { localPos.y = sign(localPos.y) * halfExtents.y; localVel.y *= -restitution; }
-  if (abs(localPos.z) > halfExtents.z) { localPos.z = sign(localPos.z) * halfExtents.z; localVel.z *= -restitution; }
+fn planetSurfaceNormal(dir: vec3<f32>) -> vec3<f32> {
+  let eps = 0.004;
+  var t1 = cross(dir, vec3<f32>(0.0, 1.0, 0.0));
+  if (length(t1) < 0.01) { t1 = cross(dir, vec3<f32>(1.0, 0.0, 0.0)); }
+  t1 = normalize(t1);
+  let t2 = normalize(cross(dir, t1));
 
-  var result: CollisionResult;
-  result.position = qRotateVec(collider.rotation, localPos) + collider.data0.xyz;
-  result.velocity = qRotateVec(collider.rotation, localVel) + collider.velocity.xyz;
-  return result;
+  var n = vec3<f32>(0.0);
+  for (var i = 0u; i < 4u; i++) {
+    let a = f32(i) * 1.5707963;
+    let ca = cos(a);
+    let sa = sin(a);
+    let u = t1 * ca + t2 * sa;
+    let v = t1 * (-sa) + t2 * ca;
+
+    let pu = samplePlanetPoint(normalize(dir + u * eps));
+    let pm = samplePlanetPoint(normalize(dir - u * eps));
+    let qu = samplePlanetPoint(normalize(dir + v * eps));
+    let qm = samplePlanetPoint(normalize(dir - v * eps));
+
+    let du = (pu - pm) * 0.5;
+    let dv = (qu - qm) * 0.5;
+    n += cross(du, dv);
+  }
+
+  let len = length(n);
+  if (len < 0.0001) { return dir; }
+  n = n / len;
+  if (dot(n, dir) < 0.0) { n = -n; }
+  return n;
 }
 
 fn resolveBox(posIn: vec3<f32>, velIn: vec3<f32>, collider: Collider, radius: f32) -> CollisionResult {
@@ -421,9 +361,7 @@ fn queryMesh(collider: Collider, worldPos: vec3<f32>) -> MeshQuery {
   return q;
 }
 
-fn resolveMesh(
-  posIn: vec3<f32>, velIn: vec3<f32>, collider: Collider, radius: f32,
-) -> CollisionResult {
+fn resolveMesh(posIn: vec3<f32>, velIn: vec3<f32>, collider: Collider, radius: f32) -> CollisionResult {
   var r: CollisionResult;
   r.position = posIn;
   r.velocity = velIn;
@@ -445,73 +383,204 @@ fn resolveMesh(
   return r;
 }
 
-fn terrainHeightAt(x: f32, z: f32) -> f32 {
-  let N = i32(params.terrainMeta.x);
-  let ext = params.terrainMeta.y;
-  let hs = params.terrainMeta.z;
-  if (params.terrainMeta.w < 0.5 || N < 2) { return -1e9; }
-
-  let cell = ext / f32(N - 1);
-  let u = clamp((x + ext * 0.5) / cell, 0.0, f32(N - 1));
-  let v = clamp((z + ext * 0.5) / cell, 0.0, f32(N - 1));
-
-  let i0x = i32(floor(u));
-  let i0y = i32(floor(v));
-  let i1x = min(i0x + 1, N - 1);
-  let i1y = min(i0y + 1, N - 1);
-  let fx = u - f32(i0x);
-  let fy = v - f32(i0y);
-
-  let h00 = terrain[i0x + i0y * N];
-  let h10 = terrain[i1x + i0y * N];
-  let h01 = terrain[i0x + i1y * N];
-  let h11 = terrain[i1x + i1y * N];
-
-  let h = mix(mix(h00, h10, fx), mix(h01, h11, fx), fy);
-  return h * hs;
-}
-
-fn resolveTerrain(
-  posIn: vec3<f32>,
-  velIn: vec3<f32>,
-  radius: f32,
-) -> CollisionResult {
+fn resolvePlanetTerrain(posIn: vec3<f32>, velIn: vec3<f32>, radius: f32) -> CollisionResult {
   var r: CollisionResult;
   r.position = posIn;
   r.velocity = velIn;
-  if (params.terrainMeta.w < 0.5) { return r; }
 
-  let container = colliders[0];
-  let invRot = qConjugate(container.rotation);
-  var localPos = qRotateVec(invRot, posIn - container.data0.xyz);
-  var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
+  let center = params.planetCenter.xyz;
+  let R = params.planetParams.x;
+  let hs = params.planetParams.y;
 
-  let baseY = -params.boundsHeight * 0.5;
-  let surfY = baseY + terrainHeightAt(localPos.x, localPos.z);
+  let delta = posIn - center;
+  let dist = length(delta);
+  if (dist < 0.0001) { return r; }
 
-  let cellSize = params.terrainMeta.y / max(params.terrainMeta.x - 1.0, 1.0);
-  let eps = max(cellSize, 0.01);
-  let dxH = terrainHeightAt(localPos.x + eps, localPos.z)
-          - terrainHeightAt(localPos.x - eps, localPos.z);
-  let dzH = terrainHeightAt(localPos.x, localPos.z + eps)
-          - terrainHeightAt(localPos.x, localPos.z - eps);
-  let n = normalize(vec3<f32>(-dxH, 2.0 * eps, -dzH));
+  let dir = delta / dist;
+  let h = samplePlanetHeight(dir) * hs;
+  let floorR = R + h + radius;
 
-  let signedDist = localPos.y - surfY;
-  if (signedDist < radius) {
-    let push = radius - signedDist;
-    localPos += n * push;
+  if (dist < floorR) {
+    let n = planetSurfaceNormal(dir);
 
-    let vn = dot(localVel, n);
+    r.position = center + dir * floorR;
+
+    let vn = dot(velIn, n);
+    var v = velIn;
     if (vn < 0.0) {
-      let restitution = container.data2.w;
-      localVel -= n * vn * (1.0 + restitution);
+      v = velIn - n * vn * (1.0 + params.collisionDamping);
+    }
+
+    let vt = v - n * dot(v, n);
+    let steep = 1.0 - dot(n, dir);
+    let friction = 0.025 * (1.0 - clamp(steep * 3.0, 0.0, 0.9));
+    v = v - vt * friction;
+
+    r.velocity = v;
+  }
+
+  return r;
+}
+
+fn resolveAllCollisions(posIn: vec3<f32>, velIn: vec3<f32>, radius: f32) -> CollisionResult {
+  var r: CollisionResult;
+  r.position = posIn;
+  r.velocity = velIn;
+
+  r = resolvePlanetTerrain(r.position, r.velocity, radius);
+
+  for (var c = 0u; c < params.numColliders; c++) {
+    let collider = colliders[c];
+    let shapeType = collider.data0.w;
+    var hit: CollisionResult;
+
+    if (shapeType < 1.5) {
+      hit = resolveBox(r.position, r.velocity, collider, radius);
+    } else if (shapeType < 2.5) {
+      hit = resolveSphere(r.position, r.velocity, collider, radius);
+    } else {
+      hit = resolveMesh(r.position, r.velocity, collider, radius);
+    }
+
+    r.position = hit.position;
+    r.velocity = hit.velocity;
+  }
+
+  return r;
+}
+
+@compute @workgroup_size(256)
+fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.numParticles) { return; }
+
+  var vel = particles[index].velocity.xyz;
+  let pos = particles[index].position.xyz;
+
+  let delta = pos - params.planetCenter.xyz;
+  let dist = length(delta);
+  if (dist > 0.0001) {
+    let dir = delta / dist;
+    vel += -dir * params.gravity * params.deltaTime;
+  }
+
+  if (params.interactionStrength != 0.0) {
+    let rayOrigin = params.interactionRayOrigin.xyz;
+    let rayDir = params.interactionRayDir.xyz;
+    let v = pos - rayOrigin;
+    let projDist = dot(v, rayDir);
+    let closestPointOnRay = rayOrigin + rayDir * max(0.0, projDist);
+
+    let offset = closestPointOnRay - pos;
+    let distSqr = dot(offset, offset);
+    let radiusSqr = params.interactionRadius * params.interactionRadius;
+
+    if (distSqr < radiusSqr && distSqr > 0.0001) {
+      let dist = sqrt(distSqr);
+      let dir = offset / dist;
+      let centerT = 1.0 - (dist / params.interactionRadius);
+      let force = (dir * params.interactionStrength - vel) * (centerT * centerT);
+      vel += force * params.deltaTime;
     }
   }
 
-  r.position = qRotateVec(container.rotation, localPos) + container.data0.xyz;
-  r.velocity = qRotateVec(container.rotation, localVel) + container.velocity.xyz;
-  return r;
+  particles[index].velocity = vec4<f32>(vel, 0.0);
+  particles[index].predictedPosition = vec4<f32>(pos + vel * params.deltaTime, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn updateSpatialHash(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.tableSize) { return; }
+
+  if (index < params.numParticles) {
+    let cellCoord = positionToCellCoord(particles[index].predictedPosition.xyz, params.smoothingRadius);
+    let key = getKeyFromHash(hashCell(cellCoord), params.tableSize);
+    spatialLookup[index] = SpatialEntry(index, key);
+  } else {
+    spatialLookup[index] = SpatialEntry(0xFFFFFFFFu, 0xFFFFFFFFu);
+  }
+}
+
+@compute @workgroup_size(256)
+fn bitonicSort(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= bitonicParams.numEntries) { return; }
+
+  let k = bitonicParams.k;
+  let j = bitonicParams.j;
+
+  let l = i ^ j;
+  if (l > i && l < bitonicParams.numEntries) {
+    let ascending = (i & k) == 0u;
+    let entryA = spatialLookup[i];
+    let entryB = spatialLookup[l];
+
+    if ((entryA.cellKey > entryB.cellKey) == ascending) {
+      spatialLookup[i] = entryB;
+      spatialLookup[l] = entryA;
+    }
+  }
+}
+
+@compute @workgroup_size(256)
+fn clearStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index < params.tableSize) { startIndices[index] = 0xFFFFFFFFu; }
+}
+
+@compute @workgroup_size(256)
+fn calculateStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.numParticles) { return; }
+
+  let key = spatialLookup[index].cellKey;
+  let prevKey = select(spatialLookup[index - 1u].cellKey, 0xFFFFFFFFu, index == 0u);
+  if (key != prevKey && key < params.tableSize) { startIndices[key] = index; }
+}
+
+@compute @workgroup_size(256)
+fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.numParticles) { return; }
+
+  let pos = particles[index].predictedPosition.xyz;
+  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
+  let radius = params.smoothingRadius;
+  let radiusSqr = radius * radius;
+
+  var density = 0.0;
+  var nearDensity = 0.0;
+
+  for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
+    for (var offsetY = -1; offsetY <= 1; offsetY++) {
+      for (var offsetX = -1; offsetX <= 1; offsetX++) {
+        let neighborCell = centerCell + vec3<i32>(offsetX, offsetY, offsetZ);
+        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
+        let startIndex = startIndices[key];
+
+        if (startIndex != 0xFFFFFFFFu) {
+          for (var i = startIndex; i < params.numParticles; i++) {
+            let entry = spatialLookup[i];
+            if (entry.cellKey != key) { break; }
+
+            let neighborIndex = entry.particleIndex;
+            let neighborPos = particles[neighborIndex].predictedPosition.xyz;
+            let diff = neighborPos - pos;
+            let distSqr = dot(diff, diff);
+
+            if (distSqr <= radiusSqr) {
+              let dist = sqrt(distSqr);
+              density += params.particleMass * densityKernel(radius, dist);
+              nearDensity += params.particleMass * nearDensityKernel(radius, dist);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  particles[index].density = vec4<f32>(density, nearDensity, 0.0, 0.0);
 }
 
 @compute @workgroup_size(256)
@@ -533,7 +602,8 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let radiusSqr = radius * radius;
 
   var pressureForce = vec3<f32>(0.0);
-  var viscosityForce = vec3<f32>(0.0);
+  var viscDelta = vec3<f32>(0.0);
+  var viscWeightSum = 0.0;
 
   for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
     for (var offsetY = -1; offsetY <= 1; offsetY++) {
@@ -577,9 +647,9 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
               }
 
               let neighborVel = particles[neighborIndex].velocity.xyz;
-              let viscWeight = viscosityKernel(radius, dist);
-              let viscDamping = min(viscWeight * params.viscosityStrength * params.deltaTime, 0.40) / max(params.deltaTime, 0.0001);
-              viscosityForce += (neighborVel - vel) * viscDamping;
+              let w = viscosityKernel(radius, dist);
+              viscDelta += (neighborVel - vel) * w;
+              viscWeightSum += w;
             }
           }
         }
@@ -588,17 +658,43 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 
   var pressureAccel = pressureForce / max(density, 0.001);
+  let accelLen = length(pressureAccel);
+  let maxAccel = 400.0;
+  if (accelLen > maxAccel) {
+    pressureAccel *= maxAccel / accelLen;
+  }
+
+  let radialUp = normalize(pos - params.planetCenter.xyz);
+  let upComponent = dot(pressureAccel, radialUp);
   let maxUpwardAccel = max(params.gravity * 3.5, 60.0);
-  pressureAccel.y = min(pressureAccel.y, maxUpwardAccel);
+
+  if (upComponent > maxUpwardAccel) {
+    pressureAccel = pressureAccel - radialUp * (upComponent - maxUpwardAccel);
+  }
 
   let totalAcceleration = select(
-    pressureAccel + (viscosityForce / max(density, 0.001)),
+    pressureAccel,
     vec3<f32>(0.0),
     density <= 0.0,
   );
 
-  let wallAccel = containerRepulsionForce(pos, params.particleRadius);
-  particles[index].velocity = vec4<f32>(vel + (totalAcceleration + wallAccel) * params.deltaTime, 0.0);
+  var newVel = vel + totalAcceleration * params.deltaTime;
+
+  if (viscWeightSum > 0.0) {
+    let avgRelVel = viscDelta / viscWeightSum;
+    let blend = clamp(params.viscosityStrength * params.deltaTime * 3.0, 0.0, 0.8);
+    newVel += avgRelVel * blend;
+  }
+
+  let speed = length(newVel);
+  let lowSpeed = clamp(speed * 12.0, 0.0, 1.0);
+  let stiction = 1.0 - params.deltaTime * 3.0 * (1.0 - lowSpeed);
+  newVel *= max(0.0, stiction);
+
+  let viscDamp = max(0.0, 1.0 - params.viscosityStrength * 0.15 * params.deltaTime);
+  newVel *= viscDamp;
+
+  particles[index].velocity = vec4<f32>(newVel, 0.0);
 }
 
 @compute @workgroup_size(256)
@@ -611,28 +707,32 @@ fn integratePositions(@builtin(global_invocation_id) id: vec3<u32>) {
 
   pos += vel * params.deltaTime;
 
-  for (var c = 0u; c < params.numColliders; c++) {
-    let collider = colliders[c];
-    let shapeType = collider.data0.w;
-    var result: CollisionResult;
+  let r = resolveAllCollisions(pos, vel, params.particleRadius);
+  pos = r.position;
+  vel = r.velocity;
 
-    if (shapeType < 0.5) {
-      result = resolveContainer(pos, vel, collider, params.particleRadius);
-    } else if (shapeType < 1.5) {
-      result = resolveBox(pos, vel, collider, params.particleRadius);
-    } else if (shapeType < 2.5) {
-      result = resolveSphere(pos, vel, collider, params.particleRadius);
-    } else {
-      result = resolveMesh(pos, vel, collider, params.particleRadius);
-    }
+  let center = params.planetCenter.xyz;
+  let R = params.planetParams.x;
+  let hs = params.planetParams.y;
+  let delta = pos - center;
+  let dist = length(delta);
 
-    pos = result.position;
-    vel = result.velocity;
+  let outer = R + hs * 6.0 + 20.0;
+  let inner = R - 2.0;
+
+  if (dist > outer || dist < inner || !(dist == dist)) {
+    let seed = f32(index) * 0.6180339887;
+    let phi = acos(clamp(2.0 * fract(seed * 2.71828) - 1.0, -1.0, 1.0));
+    let theta = fract(seed * 1.61803) * 6.2831853;
+    let dir = vec3<f32>(
+      sin(phi) * cos(theta),
+      cos(phi),
+      sin(phi) * sin(theta),
+    );
+    let alt = R + hs * 3.0 + fract(seed * 3.17) * 2.0;
+    pos = center + dir * alt;
+    vel = vec3<f32>(0.0);
   }
-
-  let tr = resolveTerrain(pos, vel, params.particleRadius);
-  pos = tr.position;
-  vel = tr.velocity;
 
   particles[index].position = vec4<f32>(pos, 1.0);
   particles[index].velocity = vec4<f32>(vel, 0.0);

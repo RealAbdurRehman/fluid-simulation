@@ -6,8 +6,12 @@ import { GPUParticleRenderer } from "./renderer";
 import { SceneRenderer } from "./sceneRenderer";
 import { camera, attachControls, resizeCamera } from "./scene";
 import { MeshRegistry } from "./meshRegistry";
-import { createSimUpdaters } from "./simUpdaters";
-import { generateTerrain, terrainToGeometry } from "./terrain";
+import { createSimUpdaters, type TerrainState } from "./simUpdaters";
+import {
+  generatePlanet,
+  planetToGeometry,
+  createPlanetSampler,
+} from "./terrain";
 
 async function bootstrap(): Promise<void> {
   const simulation = new FluidSimulationGPU();
@@ -36,43 +40,68 @@ async function bootstrap(): Promise<void> {
     new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
   );
 
-  const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
+  const planetCenter = new THREE.Vector3(
+    config.planetCenterX,
+    config.planetCenterY,
+    config.planetCenterZ,
+  );
+  simulation.setPlanetCenter(planetCenter);
 
-  let terrainMeshCounter = 0;
+  const terrainState: TerrainState = {
+    sampler: createPlanetSampler(
+      generatePlanet(
+        config.planetRadius,
+        config.planetHeightScale,
+        config.planetNoiseScale,
+        config.planetFaceResolution,
+        config.planetSeed,
+      ),
+    ),
+    center: planetCenter,
+  };
 
-  function regenerateTerrain(): void {
-    if (!config.terrainEnabled) {
-      simulation.setTerrain(null);
-      sceneRenderer.setTerrainMesh(null);
-      return;
-    }
+  const updaters = createSimUpdaters(
+    simulation,
+    sceneRenderer,
+    meshRegistry,
+    terrainState,
+  );
 
-    const baseY = -config.boundsHeight / 2;
-    const extent = config.boundsWidth * 0.95;
-    const data = generateTerrain(
-      config.terrainResolution,
-      extent,
-      config.terrainHeightScale,
-      config.terrainSeed,
+  let planetMeshCounter = 0;
+
+  function regeneratePlanet(): void {
+    const data = generatePlanet(
+      config.planetRadius,
+      config.planetHeightScale,
+      config.planetNoiseScale,
+      config.planetFaceResolution,
+      config.planetSeed,
     );
 
-    simulation.setTerrain(data);
+    simulation.setPlanet(data);
 
-    const id = `terrain_${terrainMeshCounter++}`;
-    meshRegistry.register(id, terrainToGeometry(data, baseY));
+    const id = `planet_${planetMeshCounter++}`;
+    meshRegistry.register(id, planetToGeometry(data));
     sceneRenderer.setTerrainMesh(id);
+
+    terrainState.sampler = createPlanetSampler(data);
+
+    for (let i = 0; i < config.objects.length; i++)
+      if (config.objects[i].physics && config.objects[i].type !== "none")
+        updaters.spawnObject(i);
+
+    simulation.initParticleGrid();
   }
 
   setupGUI(
     () => simulation.updateParticleCount(),
-    regenerateTerrain,
     () => {},
     (index) => updaters.requestBakeForSlot(index),
     (index) => updaters.spawnObject(index),
-    regenerateTerrain,
+    regeneratePlanet,
   );
 
-  regenerateTerrain();
+  regeneratePlanet();
 
   for (let i = 0; i < config.objects.length; i++) {
     if (config.objects[i].physics && config.objects[i].type !== "none") {
@@ -133,17 +162,17 @@ async function bootstrap(): Promise<void> {
     if (stepOnce) {
       stepOnce = false;
       accumulator = 0;
-      updaters.updateBoundsRotation(FIXED_DELTA);
+
       updaters.updateObjects(FIXED_DELTA);
       simulation.recordStepCommands(encoder, FIXED_DELTA);
-    } else if (!config.paused)
+    } else if (!config.paused) {
       while (accumulator >= FIXED_DELTA) {
         accumulator -= FIXED_DELTA;
-        updaters.updateBoundsRotation(FIXED_DELTA);
+
         updaters.updateObjects(FIXED_DELTA);
         simulation.recordStepCommands(encoder, FIXED_DELTA);
       }
-    else accumulator = 0;
+    } else accumulator = 0;
 
     sceneRenderer.updateFrame(viewState.viewProj, [
       camera.position.x,

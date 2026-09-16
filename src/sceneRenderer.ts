@@ -1,11 +1,11 @@
 import * as THREE from "three";
 
-import { config } from "./config";
 import { acesFilmicWGSL } from "./shader/common.wgsl";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const SAMPLE_COUNT = 4;
 const MAX_OBJECT_SLOTS = 16;
+const TERRAIN_SLOT = MAX_OBJECT_SLOTS - 1;
 
 const sceneShaderWGSL = /* wgsl */ `
 struct FrameUniforms {
@@ -54,19 +54,20 @@ fn vs_main(input: VIn) -> VOut {
 
 @fragment
 fn fs_main(input: VOut) -> @location(0) vec4<f32> {
-  let d = distance(input.worldPos, frame.cameraPos.xyz);
-  let fade = clamp((90.0 - d) / 70.0, 0.0, 1.0);
-  return vec4<f32>(acesFilmic(obj.color.rgb * 1.1), obj.color.a * fade);
+  return vec4<f32>(acesFilmic(obj.color.rgb * 1.1), obj.color.a);
 }
 
 struct MeshVIn {
   @location(0) position: vec3<f32>,
   @location(1) normal: vec3<f32>,
+  @location(2) color: vec3<f32>,
 };
+
 struct MeshVOut {
   @builtin(position) position: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
   @location(1) worldNormal: vec3<f32>,
+  @location(2) vertexColor: vec3<f32>,
 };
 
 @vertex
@@ -75,20 +76,28 @@ fn mesh_vs(input: MeshVIn) -> MeshVOut {
   let rotatedPos = qRotateVec(obj.rotation, scaled);
   let rotatedNormal = qRotateVec(obj.rotation, input.normal);
   let world = rotatedPos + obj.translate.xyz;
+
   var out: MeshVOut;
   out.position = frame.viewProj * vec4<f32>(world, 1.0);
   out.worldPos = world;
   out.worldNormal = rotatedNormal;
+  out.vertexColor = input.color;
   return out;
 }
 
 @fragment
-fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
-  let n = normalize(input.worldNormal);
+fn mesh_fs(
+  input: MeshVOut,
+  @builtin(front_facing) frontFacing: bool,
+) -> @location(0) vec4<f32> {
+  var n = normalize(input.worldNormal);
+  if (!frontFacing) { n = -n; }
+
   let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
   let ndl = max(dot(n, lightDir), 0.0);
 
-  var lit = obj.color.rgb * (0.28 + ndl * 0.95);
+  let baseColor = obj.color.rgb * input.vertexColor;
+  var lit = baseColor * (0.28 + ndl * 0.95);
 
   let viewDir = normalize(frame.cameraPos.xyz - input.worldPos);
   let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.55;
@@ -98,8 +107,7 @@ fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
   lit += vec3<f32>(pow(max(dot(n, halfDir), 0.0), 48.0) * 0.4);
 
   let d = distance(input.worldPos, frame.cameraPos.xyz);
-  let fade = clamp((90.0 - d) / 70.0, 0.0, 1.0);
-  return vec4<f32>(acesFilmic(lit * 1.3), obj.color.a * fade);
+  return vec4<f32>(acesFilmic(lit * 1.3), obj.color.a);
 }
 `;
 
@@ -154,18 +162,6 @@ function buildWireBox(): Float32Array {
     out[p++] = c[i * 3 + 2];
   }
   return out;
-}
-
-function buildGrid(size: number, divisions: number): Float32Array {
-  const half = size / 2;
-  const step = size / divisions;
-  const lines: number[] = [];
-  for (let i = 0; i <= divisions; i++) {
-    const t = -half + i * step;
-    lines.push(-half, 0, t, half, 0, t);
-    lines.push(t, 0, -half, t, 0, half);
-  }
-  return new Float32Array(lines);
 }
 
 function buildWireSphere(segments = 16, rings = 10): Float32Array {
@@ -234,11 +230,12 @@ const LINE_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
 
 const MESH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
   {
-    arrayStride: 24,
+    arrayStride: 36,
     stepMode: "vertex",
     attributes: [
       { shaderLocation: 0, offset: 0, format: "float32x3" },
       { shaderLocation: 1, offset: 12, format: "float32x3" },
+      { shaderLocation: 2, offset: 24, format: "float32x3" },
     ],
   },
 ];
@@ -267,10 +264,8 @@ export class SceneRenderer {
   private skyBindGroup!: GPUBindGroup;
 
   private boxBuf!: GPUBuffer;
-  private gridBuf!: GPUBuffer;
   private sphereBuf!: GPUBuffer;
   private boxVerts = 0;
-  private gridVerts = 0;
   private sphereVerts = 0;
 
   private meshRegistry = new Map<string, RegisteredMesh>();
@@ -281,8 +276,6 @@ export class SceneRenderer {
   private depthHeight = 1;
 
   private objectVisuals: ObjectVisual[] = [];
-  private boundsQuat: [number, number, number, number] = [0, 0, 0, 1];
-
   private terrainMeshId: string | null = null;
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
@@ -297,9 +290,6 @@ export class SceneRenderer {
   public setObjectVisuals(v: ObjectVisual[]): void {
     this.objectVisuals = v;
   }
-  public setBoundsRotationQuat(q: [number, number, number, number]): void {
-    this.boundsQuat = q;
-  }
   public setTerrainMesh(id: string | null): void {
     this.terrainMeshId = id;
   }
@@ -309,16 +299,22 @@ export class SceneRenderer {
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const normAttr = geometry.attributes.normal as THREE.BufferAttribute;
+    const colAttr = geometry.attributes.color as
+      | THREE.BufferAttribute
+      | undefined;
     const count = posAttr.count;
 
-    const data = new Float32Array(count * 6);
+    const data = new Float32Array(count * 9);
     for (let i = 0; i < count; i++) {
-      data[i * 6 + 0] = posAttr.getX(i);
-      data[i * 6 + 1] = posAttr.getY(i);
-      data[i * 6 + 2] = posAttr.getZ(i);
-      data[i * 6 + 3] = normAttr.getX(i);
-      data[i * 6 + 4] = normAttr.getY(i);
-      data[i * 6 + 5] = normAttr.getZ(i);
+      data[i * 9 + 0] = posAttr.getX(i);
+      data[i * 9 + 1] = posAttr.getY(i);
+      data[i * 9 + 2] = posAttr.getZ(i);
+      data[i * 9 + 3] = normAttr.getX(i);
+      data[i * 9 + 4] = normAttr.getY(i);
+      data[i * 9 + 5] = normAttr.getZ(i);
+      data[i * 9 + 6] = colAttr ? colAttr.getX(i) : 1;
+      data[i * 9 + 7] = colAttr ? colAttr.getY(i) : 1;
+      data[i * 9 + 8] = colAttr ? colAttr.getZ(i) : 1;
     }
 
     const vertexBuf = this.device.createBuffer({
@@ -458,7 +454,7 @@ export class SceneRenderer {
       fragment: { module: mod, entryPoint: "mesh_fs", targets: baseTargets },
       depthStencil,
       multisample: { count: SAMPLE_COUNT },
-      primitive: { topology: "triangle-list", cullMode: "back" },
+      primitive: { topology: "triangle-list", cullMode: "none" },
     });
 
     this.skyPipeline = this.device.createRenderPipeline({
@@ -484,10 +480,6 @@ export class SceneRenderer {
     const box = buildWireBox();
     this.boxVerts = box.length / 3;
     this.boxBuf = this.makeVertexBuffer(box);
-
-    const grid = buildGrid(60, 40);
-    this.gridVerts = grid.length / 3;
-    this.gridBuf = this.makeVertexBuffer(grid);
 
     const sphere = buildWireSphere(16, 10);
     this.sphereVerts = sphere.length / 3;
@@ -596,71 +588,47 @@ export class SceneRenderer {
     pass.setBindGroup(0, this.skyBindGroup);
     pass.draw(3);
 
-    const bw = config.boundsWidth;
-    const bh = config.boundsHeight;
-    const bd = config.boundsDepth;
-
-    this.writeObject(1, [bw, 1, bd], [0, -bh / 2, 0], [0.03, 0.09, 0.18, 0.7]);
-    this.writeObject(
-      2,
-      [60, 1, 60],
-      [0, -bh / 2 - 0.05, 0],
-      [0.0, 0.85, 1.0, 0.5],
-    );
-
     for (let i = 0; i < this.objectVisuals.length; i++) {
+      if (i >= TERRAIN_SLOT) break;
+
       const o = this.objectVisuals[i];
       if (!o.visible) continue;
 
-      const slot = 3 + i;
       const s = o.shape === "mesh" ? o.scale : o.scale * 2;
-      this.writeObject(slot, [s, s, s], o.position, o.color, o.quaternion);
+      this.writeObject(i, [s, s, s], o.position, o.color, o.quaternion);
     }
+
+    if (this.terrainMeshId)
+      this.writeObject(
+        TERRAIN_SLOT,
+        [1, 1, 1],
+        [0, 0, 0],
+        [1, 1, 1, 1],
+        [0, 0, 0, 1],
+      );
 
     pass.setBindGroup(0, this.frameBindGroup);
 
     if (this.terrainMeshId) {
       const mesh = this.meshRegistry.get(this.terrainMeshId);
       if (mesh) {
-        this.writeObject(
-          0,
-          [1, 1, 1],
-          [0, 0, 0],
-          [0.42, 0.32, 0.2, 1.0],
-          this.boundsQuat,
-        );
-
         pass.setPipeline(this.meshPipeline);
-        pass.setBindGroup(1, this.objectBindGroup, [0]);
+        pass.setBindGroup(1, this.objectBindGroup, [
+          TERRAIN_SLOT * this.objectStride,
+        ]);
         pass.setVertexBuffer(0, mesh.vertex);
         pass.setIndexBuffer(mesh.index, "uint32");
         pass.drawIndexed(mesh.indexCount);
       }
     }
 
-    this.writeObject(
-      0,
-      [bw, bh, bd],
-      [0, 0, 0],
-      [0.0, 0.95, 1.0, 0.9],
-      this.boundsQuat,
-    );
-
-    pass.setPipeline(this.linePipeline);
-    pass.setBindGroup(1, this.objectBindGroup, [2 * this.objectStride]);
-    pass.setVertexBuffer(0, this.gridBuf);
-    pass.draw(this.gridVerts);
-
-    pass.setBindGroup(1, this.objectBindGroup, [0 * this.objectStride]);
-    pass.setVertexBuffer(0, this.boxBuf);
-    pass.draw(this.boxVerts);
-
     for (let i = 0; i < this.objectVisuals.length; i++) {
+      if (i >= TERRAIN_SLOT) break;
+
       const o = this.objectVisuals[i];
       if (!o.visible) continue;
 
-      const slot = 3 + i;
-      pass.setBindGroup(1, this.objectBindGroup, [slot * this.objectStride]);
+      pass.setBindGroup(1, this.objectBindGroup, [i * this.objectStride]);
 
       const mesh =
         o.shape === "mesh" && o.meshId ? this.meshRegistry.get(o.meshId) : null;
