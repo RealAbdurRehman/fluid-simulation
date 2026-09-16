@@ -34,28 +34,6 @@ fn acesFilmic(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-struct VIn { @location(0) position: vec3<f32>, };
-struct VOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) worldPos: vec3<f32>,
-};
-
-@vertex
-fn vs_main(input: VIn) -> VOut {
-  let scaled = input.position * obj.scale.xyz;
-  let rotated = qRotateVec(obj.rotation, scaled);
-  let world = rotated + obj.translate.xyz;
-  var out: VOut;
-  out.position = frame.viewProj * vec4<f32>(world, 1.0);
-  out.worldPos = world;
-  return out;
-}
-
-@fragment
-fn fs_main(input: VOut) -> @location(0) vec4<f32> {
-  return vec4<f32>(acesFilmic(obj.color.rgb * 1.1), obj.color.a);
-}
-
 struct MeshVIn {
   @location(0) position: vec3<f32>,
   @location(1) normal: vec3<f32>,
@@ -263,7 +241,6 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
 
   let wp3 = input.localPos;
   let wp = wp3.xz;
-
   let t = terrain.time;
 
   let sandLight = vec3<f32>(0.96, 0.90, 0.76);
@@ -284,7 +261,7 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
   let coolAmt = smoothstep(0.35, 0.75, tintCoolField) * 0.35;
   albedo *= mix(vec3<f32>(1.0), warmTint, warmAmt);
   albedo *= mix(vec3<f32>(1.0), coolTint, coolAmt);
-  
+
   let warpA = fbm(wp * 0.55 + vec2<f32>(t * 0.06, t * 0.04), 3);
   let phaseA = (wp.x * 0.85 + wp.y * 0.50) * 8.0 + warpA * 10.0 + t * 0.20;
   let rippleA = sin(phaseA) * 0.5 + 0.5;
@@ -326,60 +303,8 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
 }
 `;
 
-function buildWireBox(): Float32Array {
-  const c = [
-    -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5,
-    -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
-  ];
-  const edges = [
-    0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7,
-  ];
-  const out = new Float32Array(edges.length * 3);
-  let p = 0;
-  for (const i of edges) {
-    out[p++] = c[i * 3];
-    out[p++] = c[i * 3 + 1];
-    out[p++] = c[i * 3 + 2];
-  }
-  return out;
-}
-
-function buildWireSphere(segments = 16, rings = 10): Float32Array {
-  const lines: number[] = [];
-  for (let r = 1; r < rings; r++) {
-    const phi = (r / rings) * Math.PI;
-    const y = Math.cos(phi) * 0.5;
-    const rad = Math.sin(phi) * 0.5;
-    for (let s = 0; s < segments; s++) {
-      const a0 = (s / segments) * Math.PI * 2;
-      const a1 = ((s + 1) / segments) * Math.PI * 2;
-      lines.push(Math.cos(a0) * rad, y, Math.sin(a0) * rad);
-      lines.push(Math.cos(a1) * rad, y, Math.sin(a1) * rad);
-    }
-  }
-  for (let s = 0; s < segments; s++) {
-    const th = (s / segments) * Math.PI * 2;
-    for (let r = 0; r < rings; r++) {
-      const phi0 = (r / rings) * Math.PI;
-      const phi1 = ((r + 1) / rings) * Math.PI;
-      lines.push(
-        Math.sin(phi0) * Math.cos(th) * 0.5,
-        Math.cos(phi0) * 0.5,
-        Math.sin(phi0) * Math.sin(th) * 0.5,
-      );
-      lines.push(
-        Math.sin(phi1) * Math.cos(th) * 0.5,
-        Math.cos(phi1) * 0.5,
-        Math.sin(phi1) * Math.sin(th) * 0.5,
-      );
-    }
-  }
-  return new Float32Array(lines);
-}
-
 export interface ObjectVisual {
   visible: boolean;
-  shape: "box" | "sphere" | "mesh";
   meshId?: string;
   position: [number, number, number];
   quaternion: [number, number, number, number];
@@ -399,14 +324,6 @@ const BLEND: GPUBlendState = {
     operation: "add",
   },
 };
-
-const LINE_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
-  {
-    arrayStride: 12,
-    stepMode: "vertex",
-    attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
-  },
-];
 
 const MESH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
   {
@@ -429,7 +346,6 @@ export class SceneRenderer {
   private device: GPUDevice;
   private format: GPUTextureFormat;
 
-  private linePipeline!: GPURenderPipeline;
   private meshPipeline!: GPURenderPipeline;
   private skyPipeline!: GPURenderPipeline;
   private terrainPipeline!: GPURenderPipeline;
@@ -445,11 +361,6 @@ export class SceneRenderer {
 
   private terrainUniform!: GPUBuffer;
   private terrainBindGroup!: GPUBindGroup;
-
-  private boxBuf!: GPUBuffer;
-  private sphereBuf!: GPUBuffer;
-  private boxVerts = 0;
-  private sphereVerts = 0;
 
   private meshRegistry = new Map<string, RegisteredMesh>();
 
@@ -476,7 +387,6 @@ export class SceneRenderer {
       this.device.limits.minUniformBufferOffsetAlignment || 256,
     );
     this.createPipelines();
-    this.createGeometries();
   }
   public setObjectVisuals(v: ObjectVisual[]): void {
     this.objectVisuals = v;
@@ -642,19 +552,6 @@ export class SceneRenderer {
       { format: this.format, blend: BLEND },
     ];
 
-    this.linePipeline = this.device.createRenderPipeline({
-      layout,
-      vertex: {
-        module: mod,
-        entryPoint: "vs_main",
-        buffers: LINE_VERTEX_BUFFERS,
-      },
-      fragment: { module: mod, entryPoint: "fs_main", targets: baseTargets },
-      depthStencil,
-      multisample: { count: SAMPLE_COUNT },
-      primitive: { topology: "line-list" },
-    });
-
     this.meshPipeline = this.device.createRenderPipeline({
       layout,
       vertex: {
@@ -705,23 +602,6 @@ export class SceneRenderer {
       multisample: { count: SAMPLE_COUNT },
       primitive: { topology: "triangle-list", cullMode: "back" },
     });
-  }
-  private createGeometries(): void {
-    const box = buildWireBox();
-    this.boxVerts = box.length / 3;
-    this.boxBuf = this.makeVertexBuffer(box);
-
-    const sphere = buildWireSphere(16, 10);
-    this.sphereVerts = sphere.length / 3;
-    this.sphereBuf = this.makeVertexBuffer(sphere);
-  }
-  private makeVertexBuffer(data: Float32Array): GPUBuffer {
-    const buf = this.device.createBuffer({
-      size: data.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(buf, 0, data);
-    return buf;
   }
   public resize(width: number, height: number): void {
     this.depthWidth = Math.max(1, Math.floor(width));
@@ -823,8 +703,13 @@ export class SceneRenderer {
       if (!o.visible) continue;
 
       const slot = 3 + i;
-      const s = o.shape === "mesh" ? o.scale : o.scale * 2;
-      this.writeObject(slot, [s, s, s], o.position, o.color, o.quaternion);
+      this.writeObject(
+        slot,
+        [o.scale, o.scale, o.scale],
+        o.position,
+        o.color,
+        o.quaternion,
+      );
     }
 
     pass.setBindGroup(0, this.frameBindGroup);
@@ -859,23 +744,13 @@ export class SceneRenderer {
       const slot = 3 + i;
       pass.setBindGroup(1, this.objectBindGroup, [slot * this.objectStride]);
 
-      const mesh =
-        o.shape === "mesh" && o.meshId ? this.meshRegistry.get(o.meshId) : null;
+      const mesh = o.meshId ? this.meshRegistry.get(o.meshId) : null;
+      if (!mesh) continue;
 
-      if (mesh) {
-        pass.setPipeline(this.meshPipeline);
-        pass.setVertexBuffer(0, mesh.vertex);
-        pass.setIndexBuffer(mesh.index, "uint32");
-        pass.drawIndexed(mesh.indexCount);
-      } else if (o.shape === "sphere") {
-        pass.setPipeline(this.linePipeline);
-        pass.setVertexBuffer(0, this.sphereBuf);
-        pass.draw(this.sphereVerts);
-      } else {
-        pass.setPipeline(this.linePipeline);
-        pass.setVertexBuffer(0, this.boxBuf);
-        pass.draw(this.boxVerts);
-      }
+      pass.setPipeline(this.meshPipeline);
+      pass.setVertexBuffer(0, mesh.vertex);
+      pass.setIndexBuffer(mesh.index, "uint32");
+      pass.drawIndexed(mesh.indexCount);
     }
   }
 }

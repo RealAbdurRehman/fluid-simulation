@@ -35,6 +35,12 @@ async function bootstrap(): Promise<void> {
     "torusKnot",
     new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
   );
+  meshRegistry.register(
+    "torusKnot",
+    new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
+  );
+  meshRegistry.register("sphere", new THREE.SphereGeometry(1, 32, 16));
+  meshRegistry.register("box", new THREE.BoxGeometry(2, 2, 2));
 
   const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
 

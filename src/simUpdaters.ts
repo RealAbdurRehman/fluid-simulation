@@ -16,12 +16,6 @@ const OBJECT_COLORS: Record<ObjectSlotConfig["type"], RGBA> = {
   torusKnot: [0.5, 1.0, 0.3, 0.9],
 };
 
-const VISUAL_SHAPE: Record<ActiveShape, ObjectVisual["shape"]> = {
-  sphere: "sphere",
-  box: "box",
-  torusKnot: "mesh",
-};
-
 const PROBE_OFFSETS: [number, number, number][] = (() => {
   const out: [number, number, number][] = [];
   for (let x = -1; x <= 1; x++)
@@ -222,7 +216,6 @@ function createObjectsUpdater(
   ): void {
     const visual = visuals[index];
     visual.visible = true;
-    visual.shape = VISUAL_SHAPE[shape];
     visual.position = [position.x, position.y, position.z];
     visual.quaternion = [
       quaternions[index].x,
@@ -233,7 +226,7 @@ function createObjectsUpdater(
 
     visual.scale = slot.size;
     visual.color = OBJECT_COLORS[shape];
-    visual.meshId = shape === "torusKnot" ? "torusKnot" : undefined;
+    visual.meshId = shape;
   }
 
   function buildDescriptor(
