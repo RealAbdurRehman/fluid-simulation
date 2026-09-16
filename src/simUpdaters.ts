@@ -4,7 +4,6 @@ import { config, type ObjectSlotConfig } from "./config";
 import type { FluidSimulationGPU, ObjectDescriptor } from "./simulation";
 import type { SceneRenderer, ObjectVisual } from "./sceneRenderer";
 import type { MeshRegistry } from "./meshRegistry";
-import type { PlanetSampler } from "./terrain";
 import { RigidBody, boxInertia, sphereInertia } from "./rigidBody";
 
 type RGBA = [number, number, number, number];
@@ -41,12 +40,12 @@ const MAX_ANGULAR_SPEED = 6.0;
 const AIR_LINEAR_DAMPING = 0.4;
 const AIR_ANGULAR_DAMPING = 1.2;
 
-export interface TerrainState {
-  sampler: PlanetSampler;
-  center: THREE.Vector3;
-}
+const _tmpLocalPos = new THREE.Vector3();
+const _tmpLocalVel = new THREE.Vector3();
+const _tmpInvContainerQuat = new THREE.Quaternion();
 
 export interface SimUpdaters {
+  updateBoundsRotation(dt: number): void;
   updateObjects(dt: number): void;
   requestBakeForSlot(index: number): void;
   spawnObject(index: number): void;
@@ -56,14 +55,47 @@ export function createSimUpdaters(
   simulation: FluidSimulationGPU,
   sceneRenderer: SceneRenderer,
   meshRegistry: MeshRegistry,
-  terrainState: TerrainState,
 ): SimUpdaters {
-  return createObjectsUpdater(
-    simulation,
-    sceneRenderer,
-    meshRegistry,
-    terrainState,
-  );
+  return {
+    ...createBoundsUpdater(simulation, sceneRenderer),
+    ...createObjectsUpdater(simulation, sceneRenderer, meshRegistry),
+  };
+}
+
+function createBoundsUpdater(
+  simulation: FluidSimulationGPU,
+  sceneRenderer: SceneRenderer,
+): { updateBoundsRotation(dt: number): void } {
+  const quaternion = new THREE.Quaternion();
+  let tumbleTime = 0;
+
+  function updateBoundsRotation(dt: number): void {
+    let euler: THREE.Euler;
+    if (config.boundsAutoTumble) {
+      tumbleTime += dt;
+      euler = new THREE.Euler(
+        Math.sin(tumbleTime * 0.4) * 0.5,
+        tumbleTime * 0.3,
+        Math.cos(tumbleTime * 0.3) * 0.4,
+      );
+    } else
+      euler = new THREE.Euler(
+        THREE.MathUtils.degToRad(config.boundsRotationX),
+        THREE.MathUtils.degToRad(config.boundsRotationY),
+        THREE.MathUtils.degToRad(config.boundsRotationZ),
+      );
+
+    quaternion.setFromEuler(euler);
+    simulation.setBoundsRotation(quaternion);
+    sceneRenderer.setBoundsRotationQuat([
+      quaternion.x,
+      quaternion.y,
+      quaternion.z,
+      quaternion.w,
+    ]);
+  }
+
+  return { updateBoundsRotation };
 }
 
 function bodyVolume(shape: ActiveShape, size: number): number {
@@ -81,18 +113,11 @@ function bodyInertia(
   return boxInertia(mass, s);
 }
 
-function supportRadius(size: number): number {
-  return size;
-}
-
-const _dirTmp = new THREE.Vector3();
-
 function createObjectsUpdater(
   simulation: FluidSimulationGPU,
   sceneRenderer: SceneRenderer,
   meshRegistry: MeshRegistry,
-  terrainState: TerrainState,
-): SimUpdaters {
+) {
   const slotCount = config.objects.length;
 
   const spinAngles = new Array<number>(slotCount).fill(0);
@@ -130,42 +155,6 @@ function createObjectsUpdater(
     meshRegistry.ensure(slot.type);
   }
 
-  function liftToTerrain(pos: THREE.Vector3, size: number): void {
-    const sampler = terrainState.sampler;
-
-    _dirTmp.copy(pos).sub(terrainState.center);
-    const dist = _dirTmp.length();
-    if (dist < 1e-4) return;
-    _dirTmp.divideScalar(dist);
-
-    const h = sampler.heightAt(_dirTmp) + supportRadius(size);
-    const floorR = sampler.radius + h;
-    if (dist < floorR)
-      pos.copy(terrainState.center).addScaledVector(_dirTmp, floorR);
-  }
-
-  function resolveBodyTerrain(body: RigidBody, size: number): void {
-    const sampler = terrainState.sampler;
-    const delta = body.position.clone().sub(terrainState.center);
-
-    const dist = delta.length();
-    if (dist < 1e-4) return;
-
-    const dir = delta.divideScalar(dist);
-    const h = sampler.heightAt(dir) + supportRadius(size);
-    const floorR = sampler.radius + h;
-
-    if (dist < floorR) {
-      body.position.copy(terrainState.center).addScaledVector(dir, floorR);
-      const vn = body.linearVelocity.dot(dir);
-      if (vn < 0)
-        body.linearVelocity.addScaledVector(
-          dir,
-          -vn * (1 + config.collisionDamping),
-        );
-    }
-  }
-
   function spawnBody(index: number): void {
     const slot = config.objects[index];
     if (slot.type === "none" || !slot.physics) return;
@@ -175,11 +164,7 @@ function createObjectsUpdater(
     const refDensity = Math.max(config.targetDensity, 1e-4);
     const mass = Math.max(slot.densityRatio * refDensity * volume, 1e-4);
 
-    const pos = new THREE.Vector3(slot.posX, slot.posY, slot.posZ).add(
-      terrainState.center,
-    );
-    liftToTerrain(pos, slot.size);
-
+    const pos = new THREE.Vector3(slot.posX, slot.posY, slot.posZ);
     const quat = new THREE.Quaternion().setFromEuler(
       new THREE.Euler(
         THREE.MathUtils.degToRad(slot.rotX),
@@ -221,11 +206,7 @@ function createObjectsUpdater(
     );
     quaternions[index].setFromEuler(euler);
 
-    const position = new THREE.Vector3(slot.posX, slot.posY, slot.posZ).add(
-      terrainState.center,
-    );
-    liftToTerrain(position, slot.size);
-
+    const position = new THREE.Vector3(slot.posX, slot.posY, slot.posZ);
     velocities[index]
       .subVectors(position, prevPositions[index])
       .divideScalar(Math.max(dt, 1e-4));
@@ -295,8 +276,6 @@ function createObjectsUpdater(
 
     const g = config.gravity;
     const localRho = Math.max(config.targetDensity, 1e-4);
-    const center = terrainState.center;
-
     for (let i = 0; i < slotCount; i++) {
       const slot = config.objects[i];
       if (slot.type === "none") {
@@ -383,9 +362,8 @@ function createObjectsUpdater(
       const dragSubmerged = Math.sqrt(submergedFraction);
       const dragFluidMass = localRho * body.volume * dragSubmerged;
 
-      const gravDir = body.position.clone().sub(center).normalize();
       body.applyForceWorld(
-        gravDir.multiplyScalar(-body.mass * g * fs),
+        new THREE.Vector3(0, -body.mass * g * fs, 0),
         body.position,
         dt,
       );
@@ -401,11 +379,7 @@ function createObjectsUpdater(
         centerSub.divideScalar(submergedSum);
         avgFluidVel.divideScalar(submergedSum);
 
-        const buoyancy = body.position
-          .clone()
-          .sub(center)
-          .normalize()
-          .multiplyScalar(fluidMass * g * fs);
+        const buoyancy = new THREE.Vector3(0, fluidMass * g * fs, 0);
         body.applyForceWorld(buoyancy, centerSub, dt);
 
         const relVel = new THREE.Vector3().subVectors(
@@ -433,15 +407,32 @@ function createObjectsUpdater(
         body.angularVelocity.multiplyScalar(MAX_ANGULAR_SPEED / angSpeed);
 
       body.integrate(dt);
-      resolveBodyTerrain(body, slot.size);
 
-      const distFromCenter = body.position.distanceTo(center);
-      const maxR =
-        terrainState.sampler.radius + terrainState.sampler.heightScale * 8 + 30;
-      if (distFromCenter > maxR) {
-        spawnBody(i);
-        body = bodies[i]!;
+      const containerQuat = simulation.getBoundsQuaternion();
+      const invQuat = _tmpInvContainerQuat.copy(containerQuat).invert();
+
+      _tmpLocalPos.copy(body.position).applyQuaternion(invQuat);
+      _tmpLocalVel.copy(body.linearVelocity).applyQuaternion(invQuat);
+
+      const hx = config.boundsWidth / 2 - slot.size;
+      const hy = config.boundsHeight / 2 - slot.size;
+      const hz = config.boundsDepth / 2 - slot.size;
+
+      if (Math.abs(_tmpLocalPos.x) > hx) {
+        _tmpLocalPos.x = Math.sign(_tmpLocalPos.x) * hx;
+        _tmpLocalVel.x *= -config.collisionDamping;
       }
+      if (Math.abs(_tmpLocalPos.y) > hy) {
+        _tmpLocalPos.y = Math.sign(_tmpLocalPos.y) * hy;
+        _tmpLocalVel.y *= -config.collisionDamping;
+      }
+      if (Math.abs(_tmpLocalPos.z) > hz) {
+        _tmpLocalPos.z = Math.sign(_tmpLocalPos.z) * hz;
+        _tmpLocalVel.z *= -config.collisionDamping;
+      }
+
+      body.position.copy(_tmpLocalPos).applyQuaternion(containerQuat);
+      body.linearVelocity.copy(_tmpLocalVel).applyQuaternion(containerQuat);
 
       quaternions[i].copy(body.quaternion);
       velocities[i].copy(body.linearVelocity);

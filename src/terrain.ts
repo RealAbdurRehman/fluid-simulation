@@ -1,76 +1,50 @@
 import * as THREE from "three";
 
-export interface PlanetData {
-  radius: number;
-  heightScale: number;
-  noiseScale: number;
+export interface TerrainData {
   resolution: number;
+  extentX: number;
+  extentZ: number;
+  heightScale: number;
   heights: Float32Array;
 }
 
-export interface PlanetSampler {
-  radius: number;
-  heightScale: number;
-  heightAt(dir: THREE.Vector3): number;
-}
-
-function hash3(x: number, y: number, z: number, seed: number): number {
-  let h =
-    (x | 0) * 374761393 +
-    (y | 0) * 668265263 +
-    (z | 0) * 2147483647 +
-    (seed | 0) * 69069;
+function hash2(x: number, y: number, seed: number): number {
+  let h = (x | 0) * 374761393 + (y | 0) * 668265263 + (seed | 0) * 69069;
   h = (h ^ (h >> 13)) * 1274126177;
   h = h ^ (h >> 16);
 
   return (h >>> 0) / 4294967296;
 }
 
-function valueNoise3(x: number, y: number, z: number, seed: number): number {
-  const xi = Math.floor(x),
-    yi = Math.floor(y),
-    zi = Math.floor(z);
-  const xf = x - xi,
-    yf = y - yi,
-    zf = z - zi;
+function smoothNoise(x: number, y: number, seed: number): number {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+
+  const xf = x - xi;
+  const yf = y - yi;
+
   const u = xf * xf * (3 - 2 * xf);
   const v = yf * yf * (3 - 2 * yf);
-  const w = zf * zf * (3 - 2 * zf);
 
-  const c000 = hash3(xi, yi, zi, seed);
-  const c100 = hash3(xi + 1, yi, zi, seed);
-  const c010 = hash3(xi, yi + 1, zi, seed);
-  const c110 = hash3(xi + 1, yi + 1, zi, seed);
-  const c001 = hash3(xi, yi, zi + 1, seed);
-  const c101 = hash3(xi + 1, yi, zi + 1, seed);
-  const c011 = hash3(xi, yi + 1, zi + 1, seed);
-  const c111 = hash3(xi + 1, yi + 1, zi + 1, seed);
+  const a = hash2(xi, yi, seed);
+  const b = hash2(xi + 1, yi, seed);
+  const c = hash2(xi, yi + 1, seed);
+  const d = hash2(xi + 1, yi + 1, seed);
 
-  const x00 = c000 + (c100 - c000) * u;
-  const x10 = c010 + (c110 - c010) * u;
-  const x01 = c001 + (c101 - c001) * u;
-  const x11 = c011 + (c111 - c011) * u;
+  const ab = a + (b - a) * u;
+  const cd = c + (d - c) * u;
 
-  const y0 = x00 + (x10 - x00) * v;
-  const y1 = x01 + (x11 - x01) * v;
-
-  return y0 + (y1 - y0) * w;
+  return ab + (cd - ab) * v;
 }
 
-function fbm3(
-  x: number,
-  y: number,
-  z: number,
-  octaves: number,
-  seed: number,
-): number {
-  let sum = 0,
-    amp = 0.5,
-    freq = 1,
-    norm = 0;
+function fbm(x: number, y: number, octaves: number, seed: number): number {
+  let amp = 0.5;
+  let freq = 1.0;
 
+  let sum = 0;
+  let norm = 0;
   for (let o = 0; o < octaves; o++) {
-    sum += amp * valueNoise3(x * freq, y * freq, z * freq, seed + o * 17);
+    sum += amp * smoothNoise(x * freq, y * freq, seed + o * 17);
     norm += amp;
     amp *= 0.5;
     freq *= 2.0;
@@ -79,283 +53,155 @@ function fbm3(
   return sum / Math.max(norm, 1e-6);
 }
 
-export function faceUVToDir(
-  face: number,
-  s: number,
-  t: number,
-  out: THREE.Vector3 = new THREE.Vector3(),
-): THREE.Vector3 {
-  switch (face) {
-    case 0:
-      out.set(1, -t, -s);
-      break;
-    case 1:
-      out.set(-1, -t, s);
-      break;
-    case 2:
-      out.set(s, 1, t);
-      break;
-    case 3:
-      out.set(s, -1, -t);
-      break;
-    case 4:
-      out.set(s, -t, 1);
-      break;
-    case 5:
-      out.set(-s, -t, -1);
-      break;
-    default:
-      out.set(0, 1, 0);
-  }
-
-  return out.normalize();
-}
-
-export function dirToFaceUV(dir: THREE.Vector3): {
-  face: number;
-  u: number;
-  v: number;
-} {
-  const ax = Math.abs(dir.x),
-    ay = Math.abs(dir.y),
-    az = Math.abs(dir.z);
-
-  let face: number, s: number, t: number;
-  if (ax >= ay && ax >= az) {
-    if (dir.x > 0) {
-      face = 0;
-      s = -dir.z / ax;
-      t = -dir.y / ax;
-    } else {
-      face = 1;
-      s = dir.z / ax;
-      t = -dir.y / ax;
-    }
-  } else if (ay >= az) {
-    if (dir.y > 0) {
-      face = 2;
-      s = dir.x / ay;
-      t = dir.z / ay;
-    } else {
-      face = 3;
-      s = dir.x / ay;
-      t = -dir.z / ay;
-    }
-  } else {
-    if (dir.z > 0) {
-      face = 4;
-      s = dir.x / az;
-      t = -dir.y / az;
-    } else {
-      face = 5;
-      s = -dir.x / az;
-      t = -dir.y / az;
-    }
-  }
-
-  return { face, u: (s + 1) * 0.5, v: (t + 1) * 0.5 };
-}
-
-function shapeHeight(
-  dir: THREE.Vector3,
-  noiseScale: number,
-  seed: number,
-): number {
-  const nx = dir.x * noiseScale;
-  const ny = dir.y * noiseScale;
-  const nz = dir.z * noiseScale;
-
-  const ridge1 =
-    1.0 - Math.abs(fbm3(nx * 1.2, ny * 1.2, nz * 1.2, 5, seed) * 2.0 - 1.0);
-  const ridge2 =
-    1.0 -
-    Math.abs(fbm3(nx * 3.0, ny * 3.0, nz * 3.0, 5, seed + 100) * 2.0 - 1.0);
-  const detail = fbm3(nx * 7.0, ny * 7.0, nz * 7.0, 4, seed + 200);
-
-  let h = ridge1 * 0.45 + ridge2 * 0.35 + detail * 0.2;
-  h = (h - 0.65) * 2.5 + 0.5;
-
-  return THREE.MathUtils.clamp(h, 0.0, 1.0);
-}
-
-export function generatePlanet(
-  radius: number,
-  heightScale: number,
-  noiseScale: number,
+export function generateTerrain(
   resolution: number,
+  extentX: number,
+  extentZ: number,
+  heightScale: number,
   seed: number,
-): PlanetData {
+): TerrainData {
   const N = Math.max(4, Math.floor(resolution));
-  const heights = new Float32Array(6 * N * N);
-  const dir = new THREE.Vector3();
+  const heights = new Float32Array(N * N);
+  const scale = 2.5;
 
-  for (let face = 0; face < 6; face++) {
-    const base = face * N * N;
-    for (let j = 0; j < N; j++) {
-      for (let i = 0; i < N; i++) {
-        const s = (i / (N - 1)) * 2 - 1;
-        const t = (j / (N - 1)) * 2 - 1;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const u = i / (N - 1);
+      const v = j / (N - 1);
 
-        faceUVToDir(face, s, t, dir);
-        heights[base + j * N + i] = shapeHeight(dir, noiseScale, seed);
-      }
+      let h = fbm(u * scale, v * scale, 6, seed);
+
+      const ridge =
+        1.0 -
+        Math.abs(fbm(u * scale * 2, v * scale * 2, 4, seed + 100) * 2 - 1);
+      h = h * 0.7 + ridge * 0.3 * h;
+
+      const cx = u - 0.5;
+      const cz = v - 0.5;
+      const r = Math.sqrt(cx * cx + cz * cz);
+      const bowl = THREE.MathUtils.smoothstep(r, 0.05, 0.45);
+
+      h *= bowl;
+      heights[j * N + i] = Math.pow(THREE.MathUtils.clamp(h, 0, 1), 1.5);
     }
   }
 
-  return { radius, heightScale, noiseScale, resolution: N, heights };
+  return { resolution: N, extentX, extentZ, heightScale, heights };
 }
 
-export function createPlanetSampler(planet: PlanetData): PlanetSampler {
-  const N = planet.resolution;
-  const hs = planet.heightScale;
-  const heights = planet.heights;
-
-  return {
-    radius: planet.radius,
-    heightScale: hs,
-    heightAt(dir: THREE.Vector3): number {
-      const { face, u, v } = dirToFaceUV(dir);
-      const uu = THREE.MathUtils.clamp(u, 0, 1) * (N - 1);
-      const vv = THREE.MathUtils.clamp(v, 0, 1) * (N - 1);
-      const i0 = Math.floor(uu),
-        j0 = Math.floor(vv);
-      const i1 = Math.min(i0 + 1, N - 1),
-        j1 = Math.min(j0 + 1, N - 1);
-      const fx = uu - i0,
-        fy = vv - j0;
-
-      const base = face * N * N;
-      const h00 = heights[base + j0 * N + i0];
-      const h10 = heights[base + j0 * N + i1];
-      const h01 = heights[base + j1 * N + i0];
-      const h11 = heights[base + j1 * N + i1];
-
-      const top = h00 + (h10 - h00) * fx;
-      const bot = h01 + (h11 - h01) * fx;
-      return (top + (bot - top) * fy) * hs;
-    },
-  };
-}
-
-export function planetToGeometry(planet: PlanetData): THREE.BufferGeometry {
-  const N = planet.resolution;
-  const R = planet.radius;
-  const hs = planet.heightScale;
-  const perFace = N * N;
-  const totalVerts = 6 * perFace;
-
-  const positions = new Float32Array(totalVerts * 3);
-  const uvs = new Float32Array(totalVerts * 2);
-  const dir = new THREE.Vector3();
-
-  for (let face = 0; face < 6; face++) {
-    const base = face * perFace;
-    for (let j = 0; j < N; j++) {
-      for (let i = 0; i < N; i++) {
-        const u = i / (N - 1);
-        const v = j / (N - 1);
-        const s = u * 2 - 1;
-        const t = v * 2 - 1;
-        faceUVToDir(face, s, t, dir);
-
-        const h = planet.heights[base + j * N + i] * hs;
-        const r = R + h;
-        const idx = base + j * N + i;
-
-        positions[idx * 3 + 0] = dir.x * r;
-        positions[idx * 3 + 1] = dir.y * r;
-        positions[idx * 3 + 2] = dir.z * r;
-
-        uvs[idx * 2 + 0] = u;
-        uvs[idx * 2 + 1] = v;
-      }
-    }
-  }
-
-  const indicesPerFace = (N - 1) * (N - 1) * 6;
-  const indices = new Uint32Array(6 * indicesPerFace);
-  let o = 0;
-
-  for (let face = 0; face < 6; face++) {
-    const base = face * perFace;
-    for (let j = 0; j < N - 1; j++) {
-      for (let i = 0; i < N - 1; i++) {
-        const a = base + j * N + i;
-        const b = a + 1;
-        const c = a + N;
-        const d = c + 1;
-        indices[o++] = a;
-        indices[o++] = b;
-        indices[o++] = c;
-        indices[o++] = b;
-        indices[o++] = d;
-        indices[o++] = c;
-      }
-    }
-  }
-
+export function terrainToGeometry(
+  terrain: TerrainData,
+  baseY: number,
+  depth: number = 3.0,
+): THREE.BufferGeometry {
+  const { resolution: N, extentX, extentZ, heightScale, heights } = terrain;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-  geo.setIndex(new THREE.BufferAttribute(indices, 1));
-  geo.computeVertexNormals();
+  const halfX = extentX * 0.5;
+  const halfZ = extentZ * 0.5;
+  const cellX = extentX / (N - 1);
+  const cellZ = extentZ / (N - 1);
+  const bottomY = baseY - depth;
 
-  const normals = geo.attributes.normal as THREE.BufferAttribute;
-  const colors = new Float32Array(totalVerts * 3);
-  const nrm = new THREE.Vector3();
-  const radial = new THREE.Vector3();
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
 
-  const rock: [number, number, number] = [0.34, 0.29, 0.26];
-  const grass: [number, number, number] = [0.2, 0.42, 0.16];
-  const sand: [number, number, number] = [0.72, 0.63, 0.39];
-  const snow: [number, number, number] = [0.92, 0.94, 0.97];
-  const deep: [number, number, number] = [0.13, 0.2, 0.24];
+  const sampleTopY = (i: number, j: number) => {
+    const ii = Math.max(0, Math.min(N - 1, i));
+    const jj = Math.max(0, Math.min(N - 1, j));
+    return baseY + heights[jj * N + ii] * heightScale;
+  };
 
-  const seaLevel = 0.12 * hs;
-  const snowLine = 0.75 * hs;
+  const topBase = 0;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const x = -halfX + i * cellX;
+      const z = -halfZ + j * cellZ;
+      const y = sampleTopY(i, j);
+      positions.push(x, y, z);
 
-  for (let face = 0; face < 6; face++) {
-    const base = face * perFace;
-    for (let j = 0; j < N; j++)
-      for (let i = 0; i < N; i++) {
-        const idx = base + j * N + i;
-
-        nrm
-          .set(normals.getX(idx), normals.getY(idx), normals.getZ(idx))
-          .normalize();
-        radial
-          .set(
-            positions[idx * 3 + 0],
-            positions[idx * 3 + 1],
-            positions[idx * 3 + 2],
-          )
-          .normalize();
-
-        const slope = nrm.dot(radial);
-        const h = planet.heights[idx] * hs;
-
-        let c: [number, number, number];
-
-        if (h < seaLevel) {
-          c = deep;
-        } else if (h > snowLine && slope > 0.55) c = snow;
-        else if (slope < 0.75) {
-          const t = THREE.MathUtils.clamp((0.75 - slope) / 0.4, 0, 1);
-          c = [
-            sand[0] + (rock[0] - sand[0]) * t,
-            sand[1] + (rock[1] - sand[1]) * t,
-            sand[2] + (rock[2] - sand[2]) * t,
-          ];
-        } else if (h < seaLevel + 0.2 * hs) c = sand;
-        else c = grass;
-
-        colors[idx * 3 + 0] = c[0];
-        colors[idx * 3 + 1] = c[1];
-        colors[idx * 3 + 2] = c[2];
-      }
+      const dx = (sampleTopY(i + 1, j) - sampleTopY(i - 1, j)) / (2 * cellX);
+      const dz = (sampleTopY(i, j + 1) - sampleTopY(i, j - 1)) / (2 * cellZ);
+      const nx = -dx;
+      const ny = 1.0;
+      const nz = -dz;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      normals.push(nx / len, ny / len, nz / len);
+    }
   }
 
-  geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  for (let j = 0; j < N - 1; j++) {
+    for (let i = 0; i < N - 1; i++) {
+      const a = topBase + j * N + i;
+      const b = a + 1;
+      const c = a + N;
+      const d = c + 1;
+      indices.push(a, c, b);
+      indices.push(b, c, d);
+    }
+  }
+
+  const botBase = positions.length / 3;
+  positions.push(-halfX, bottomY, -halfZ);
+  positions.push(halfX, bottomY, -halfZ);
+  positions.push(halfX, bottomY, halfZ);
+  positions.push(-halfX, bottomY, halfZ);
+  for (let k = 0; k < 4; k++) normals.push(0, -1, 0);
+
+  indices.push(botBase + 0, botBase + 1, botBase + 2);
+  indices.push(botBase + 0, botBase + 2, botBase + 3);
+
+  const sides: {
+    pointAt: (k: number) => [number, number, number];
+    normal: [number, number, number];
+  }[] = [
+    {
+      pointAt: (k) => [-halfX + k * cellX, sampleTopY(k, 0), -halfZ],
+      normal: [0, 0, -1],
+    },
+    {
+      pointAt: (k) => [halfX, sampleTopY(N - 1, k), -halfZ + k * cellZ],
+      normal: [1, 0, 0],
+    },
+    {
+      pointAt: (k) => [halfX - k * cellX, sampleTopY(N - 1 - k, N - 1), halfZ],
+      normal: [0, 0, 1],
+    },
+    {
+      pointAt: (k) => [-halfX, sampleTopY(0, N - 1 - k), halfZ - k * cellZ],
+      normal: [-1, 0, 0],
+    },
+  ];
+
+  for (const side of sides) {
+    const sideBase = positions.length / 3;
+
+    for (let k = 0; k < N; k++) {
+      const p = side.pointAt(k);
+      positions.push(p[0], p[1], p[2]);
+      normals.push(side.normal[0], side.normal[1], side.normal[2]);
+    }
+
+    for (let k = 0; k < N; k++) {
+      const p = side.pointAt(k);
+      positions.push(p[0], bottomY, p[2]);
+      normals.push(side.normal[0], side.normal[1], side.normal[2]);
+    }
+
+    for (let k = 0; k < N - 1; k++) {
+      const tk = sideBase + k;
+      const tk1 = sideBase + k + 1;
+      const bk = sideBase + N + k;
+      const bk1 = sideBase + N + k + 1;
+
+      indices.push(bk, tk, tk1);
+      indices.push(bk, tk1, bk1);
+    }
+  }
+
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geo.setIndex(indices);
   geo.computeBoundingSphere();
 
   return geo;

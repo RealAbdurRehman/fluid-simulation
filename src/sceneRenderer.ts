@@ -5,7 +5,6 @@ import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const SAMPLE_COUNT = 4;
 const MAX_OBJECT_SLOTS = 16;
-const TERRAIN_SLOT = MAX_OBJECT_SLOTS - 1;
 
 const sceneShaderWGSL = /* wgsl */ `
 struct FrameUniforms {
@@ -60,14 +59,11 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
 struct MeshVIn {
   @location(0) position: vec3<f32>,
   @location(1) normal: vec3<f32>,
-  @location(2) color: vec3<f32>,
 };
-
 struct MeshVOut {
   @builtin(position) position: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
   @location(1) worldNormal: vec3<f32>,
-  @location(2) vertexColor: vec3<f32>,
 };
 
 @vertex
@@ -76,28 +72,20 @@ fn mesh_vs(input: MeshVIn) -> MeshVOut {
   let rotatedPos = qRotateVec(obj.rotation, scaled);
   let rotatedNormal = qRotateVec(obj.rotation, input.normal);
   let world = rotatedPos + obj.translate.xyz;
-
   var out: MeshVOut;
   out.position = frame.viewProj * vec4<f32>(world, 1.0);
   out.worldPos = world;
   out.worldNormal = rotatedNormal;
-  out.vertexColor = input.color;
   return out;
 }
 
 @fragment
-fn mesh_fs(
-  input: MeshVOut,
-  @builtin(front_facing) frontFacing: bool,
-) -> @location(0) vec4<f32> {
-  var n = normalize(input.worldNormal);
-  if (!frontFacing) { n = -n; }
-
+fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
+  let n = normalize(input.worldNormal);
   let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
   let ndl = max(dot(n, lightDir), 0.0);
 
-  let baseColor = obj.color.rgb * input.vertexColor;
-  var lit = baseColor * (0.28 + ndl * 0.95);
+  var lit = obj.color.rgb * (0.28 + ndl * 0.95);
 
   let viewDir = normalize(frame.cameraPos.xyz - input.worldPos);
   let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.55;
@@ -106,7 +94,6 @@ fn mesh_fs(
   let halfDir = normalize(lightDir + viewDir);
   lit += vec3<f32>(pow(max(dot(n, halfDir), 0.0), 48.0) * 0.4);
 
-  let d = distance(input.worldPos, frame.cameraPos.xyz);
   return vec4<f32>(acesFilmic(lit * 1.3), obj.color.a);
 }
 `;
@@ -143,6 +130,199 @@ fn sky_fs(@builtin(position) fragPos: vec4<f32>) -> @location(0) vec4<f32> {
     c = mix(sky.horizonColor.rgb, sky.bottomColor.rgb, (t - 0.5) * 2.0);
   }
   return vec4<f32>(acesFilmic(c * 1.3), 1.0);
+}
+`;
+
+const terrainShaderWGSL = /* wgsl */ `
+struct FrameUniforms {
+  viewProj: mat4x4<f32>,
+  cameraPos: vec4<f32>,
+};
+
+struct TerrainUniforms {
+  rotation: vec4<f32>,
+  time: f32,
+  waterLevel: f32,
+  causticStrength: f32,
+  fogDensity: f32,
+};
+
+@group(0) @binding(0) var<uniform> frame: FrameUniforms;
+@group(1) @binding(0) var<uniform> terrain: TerrainUniforms;
+
+fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let qv = q.xyz;
+  let uv = cross(qv, v);
+  let uuv = cross(qv, uv);
+  return v + ((uv * q.w) + uuv) * 2.0;
+}
+
+fn acesFilmic(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var q = fract(p * vec2<f32>(127.1, 311.7));
+  q += dot(q, q + 34.23);
+  return fract(q.x * q.y);
+}
+
+fn valueNoise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm(p0: vec2<f32>, octaves: i32) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var p = p0;
+  for (var i = 0; i < octaves; i++) {
+    v += a * valueNoise(p);
+    p = p * 2.07 + vec2<f32>(1.7, 9.2);
+    a *= 0.5;
+  }
+  return v;
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+  var q = fract(p * vec3<f32>(127.1, 311.7, 74.7));
+  q += dot(q, q.yzx + 34.23);
+  return fract(q.x * q.y * q.z);
+}
+
+fn valueNoise3(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  let c000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+  let c100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+  let c010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+  let c110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+  let c001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+  let c101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+  let c011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+  let c111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+
+  let c00 = mix(c000, c100, u.x);
+  let c10 = mix(c010, c110, u.x);
+  let c01 = mix(c001, c101, u.x);
+  let c11 = mix(c011, c111, u.x);
+
+  return mix(mix(c00, c10, u.y), mix(c01, c11, u.y), u.z);
+}
+
+fn fbm3(p0: vec3<f32>, octaves: i32) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var p = p0;
+  for (var i = 0; i < octaves; i++) {
+    v += a * valueNoise3(p);
+    p = p * 2.07 + vec3<f32>(1.7, 9.2, 3.3);
+    a *= 0.5;
+  }
+  return v;
+}
+
+struct VIn {
+  @location(0) position: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+};
+
+struct VOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) worldNormal: vec3<f32>,
+  @location(2) localPos: vec3<f32>,
+};
+
+@vertex
+fn terrain_vs(input: VIn) -> VOut {
+  let world = qRotateVec(terrain.rotation, input.position);
+  let worldN = qRotateVec(terrain.rotation, input.normal);
+  var out: VOut;
+  out.position = frame.viewProj * vec4<f32>(world, 1.0);
+  out.worldPos = world;
+  out.worldNormal = worldN;
+  out.localPos = input.position;
+  return out;
+}
+
+@fragment
+fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
+  let n = normalize(input.worldNormal);
+  let up = max(n.y, 0.0);
+  let slope = 1.0 - up;
+
+  let wp3 = input.localPos;
+  let wp = wp3.xz;
+
+  let t = terrain.time;
+
+  let sandLight = vec3<f32>(0.96, 0.90, 0.76);
+  let sandMid   = vec3<f32>(0.86, 0.77, 0.60);
+  let sandDeep  = vec3<f32>(0.62, 0.54, 0.42);
+
+  let drift = fbm3(wp3 * 0.22, 4);
+  var albedo = mix(sandDeep, sandLight, drift);
+
+  let lum = dot(albedo, vec3<f32>(0.299, 0.587, 0.114));
+  albedo = max(vec3<f32>(0.0), mix(vec3<f32>(lum), albedo, 1.18));
+
+  let tintWarmField = fbm3(wp3 * 0.42 + vec3<f32>(51.3, 12.7, 33.1), 3);
+  let tintCoolField = fbm3(wp3 * 0.31 + vec3<f32>(-8.9, 47.1, 27.4), 3);
+  let warmTint = vec3<f32>(1.07, 1.00, 0.88);
+  let coolTint = vec3<f32>(0.90, 0.96, 1.08);
+  let warmAmt = smoothstep(0.35, 0.75, tintWarmField) * 0.40;
+  let coolAmt = smoothstep(0.35, 0.75, tintCoolField) * 0.35;
+  albedo *= mix(vec3<f32>(1.0), warmTint, warmAmt);
+  albedo *= mix(vec3<f32>(1.0), coolTint, coolAmt);
+  
+  let warpA = fbm(wp * 0.55 + vec2<f32>(t * 0.06, t * 0.04), 3);
+  let phaseA = (wp.x * 0.85 + wp.y * 0.50) * 8.0 + warpA * 10.0 + t * 0.20;
+  let rippleA = sin(phaseA) * 0.5 + 0.5;
+
+  let warpB = fbm(wp * 0.80 + vec2<f32>(-t * 0.05, t * 0.07) + 30.0, 3);
+  let phaseB = (wp.x * -0.45 + wp.y * 0.95) * 13.0 + warpB * 7.0 + t * 0.14;
+  let rippleB = sin(phaseB) * 0.5 + 0.5;
+
+  let regionMask = smoothstep(
+    0.35,
+    0.65,
+    fbm(wp * 0.06 + vec2<f32>(t * 0.008, -t * 0.006) + 100.0, 3)
+  );
+  let ripple = mix(rippleA, rippleB, regionMask);
+
+  let rippleMask = smoothstep(0.35, 0.90, up);
+  albedo *= 0.94 + ripple * 0.10 * rippleMask;
+
+  let grain = fbm3(wp3 * 8.0, 2);
+  albedo *= 0.96 + grain * 0.08;
+
+  albedo = mix(albedo, sandMid, slope * 0.5);
+
+  let sunDir = normalize(vec3<f32>(0.35, 0.75, 0.30));
+  let ndl = max(dot(n, sunDir), 0.0);
+  let halfLambert = ndl * 0.7 + 0.30;
+  let sunCol = vec3<f32>(1.02, 0.98, 0.92);
+  var lit = albedo * halfLambert * sunCol * 1.65;
+
+  let depth = clamp(-input.localPos.y * 0.10, 0.0, 1.0);
+  lit = mix(lit, lit * vec3<f32>(0.72, 0.66, 0.56), depth * 0.40);
+
+  let toCam = frame.cameraPos.xyz - input.worldPos;
+  let viewDir = toCam / max(length(toCam), 1e-4);
+  let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.05;
+  lit += vec3<f32>(0.85, 0.80, 0.72) * rim;
+
+  return vec4<f32>(acesFilmic(lit), 1.0);
 }
 `;
 
@@ -230,12 +410,11 @@ const LINE_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
 
 const MESH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
   {
-    arrayStride: 36,
+    arrayStride: 24,
     stepMode: "vertex",
     attributes: [
       { shaderLocation: 0, offset: 0, format: "float32x3" },
       { shaderLocation: 1, offset: 12, format: "float32x3" },
-      { shaderLocation: 2, offset: 24, format: "float32x3" },
     ],
   },
 ];
@@ -253,6 +432,7 @@ export class SceneRenderer {
   private linePipeline!: GPURenderPipeline;
   private meshPipeline!: GPURenderPipeline;
   private skyPipeline!: GPURenderPipeline;
+  private terrainPipeline!: GPURenderPipeline;
 
   private frameUniform!: GPUBuffer;
   private frameBindGroup!: GPUBindGroup;
@@ -262,6 +442,9 @@ export class SceneRenderer {
 
   private skyUniform!: GPUBuffer;
   private skyBindGroup!: GPUBindGroup;
+
+  private terrainUniform!: GPUBuffer;
+  private terrainBindGroup!: GPUBindGroup;
 
   private boxBuf!: GPUBuffer;
   private sphereBuf!: GPUBuffer;
@@ -276,7 +459,15 @@ export class SceneRenderer {
   private depthHeight = 1;
 
   private objectVisuals: ObjectVisual[] = [];
+  private boundsQuat: [number, number, number, number] = [0, 0, 0, 1];
+
   private terrainMeshId: string | null = null;
+
+  public time = 0;
+  public waterLevel = 0;
+  public causticStrength = 0.7;
+  public fogDensity = 0.6;
+
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
     this.format = format;
@@ -290,6 +481,9 @@ export class SceneRenderer {
   public setObjectVisuals(v: ObjectVisual[]): void {
     this.objectVisuals = v;
   }
+  public setBoundsRotationQuat(q: [number, number, number, number]): void {
+    this.boundsQuat = q;
+  }
   public setTerrainMesh(id: string | null): void {
     this.terrainMeshId = id;
   }
@@ -299,22 +493,16 @@ export class SceneRenderer {
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const normAttr = geometry.attributes.normal as THREE.BufferAttribute;
-    const colAttr = geometry.attributes.color as
-      | THREE.BufferAttribute
-      | undefined;
     const count = posAttr.count;
 
-    const data = new Float32Array(count * 9);
+    const data = new Float32Array(count * 6);
     for (let i = 0; i < count; i++) {
-      data[i * 9 + 0] = posAttr.getX(i);
-      data[i * 9 + 1] = posAttr.getY(i);
-      data[i * 9 + 2] = posAttr.getZ(i);
-      data[i * 9 + 3] = normAttr.getX(i);
-      data[i * 9 + 4] = normAttr.getY(i);
-      data[i * 9 + 5] = normAttr.getZ(i);
-      data[i * 9 + 6] = colAttr ? colAttr.getX(i) : 1;
-      data[i * 9 + 7] = colAttr ? colAttr.getY(i) : 1;
-      data[i * 9 + 8] = colAttr ? colAttr.getZ(i) : 1;
+      data[i * 6 + 0] = posAttr.getX(i);
+      data[i * 6 + 1] = posAttr.getY(i);
+      data[i * 6 + 2] = posAttr.getZ(i);
+      data[i * 6 + 3] = normAttr.getX(i);
+      data[i * 6 + 4] = normAttr.getY(i);
+      data[i * 6 + 5] = normAttr.getZ(i);
     }
 
     const vertexBuf = this.device.createBuffer({
@@ -347,6 +535,9 @@ export class SceneRenderer {
   private createPipelines(): void {
     const mod = this.device.createShaderModule({ code: sceneShaderWGSL });
     const skyMod = this.device.createShaderModule({ code: skyShaderWGSL });
+    const terrainMod = this.device.createShaderModule({
+      code: terrainShaderWGSL,
+    });
 
     const frameLayout = this.device.createBindGroupLayout({
       entries: [
@@ -421,6 +612,26 @@ export class SceneRenderer {
       entries: [{ binding: 0, resource: { buffer: this.skyUniform } }],
     });
 
+    const terrainLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
+
+    this.terrainUniform = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    this.terrainBindGroup = this.device.createBindGroup({
+      layout: terrainLayout,
+      entries: [{ binding: 0, resource: { buffer: this.terrainUniform } }],
+    });
+
     const depthStencil: GPUDepthStencilState = {
       format: "depth24plus",
       depthWriteEnabled: true,
@@ -454,7 +665,7 @@ export class SceneRenderer {
       fragment: { module: mod, entryPoint: "mesh_fs", targets: baseTargets },
       depthStencil,
       multisample: { count: SAMPLE_COUNT },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "back" },
     });
 
     this.skyPipeline = this.device.createRenderPipeline({
@@ -474,6 +685,25 @@ export class SceneRenderer {
       },
       multisample: { count: SAMPLE_COUNT },
       primitive: { topology: "triangle-list" },
+    });
+
+    this.terrainPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [frameLayout, terrainLayout],
+      }),
+      vertex: {
+        module: terrainMod,
+        entryPoint: "terrain_vs",
+        buffers: MESH_VERTEX_BUFFERS,
+      },
+      fragment: {
+        module: terrainMod,
+        entryPoint: "terrain_fs",
+        targets: baseTargets,
+      },
+      depthStencil,
+      multisample: { count: SAMPLE_COUNT },
+      primitive: { topology: "triangle-list", cullMode: "back" },
     });
   }
   private createGeometries(): void {
@@ -589,33 +819,33 @@ export class SceneRenderer {
     pass.draw(3);
 
     for (let i = 0; i < this.objectVisuals.length; i++) {
-      if (i >= TERRAIN_SLOT) break;
-
       const o = this.objectVisuals[i];
       if (!o.visible) continue;
 
+      const slot = 3 + i;
       const s = o.shape === "mesh" ? o.scale : o.scale * 2;
-      this.writeObject(i, [s, s, s], o.position, o.color, o.quaternion);
+      this.writeObject(slot, [s, s, s], o.position, o.color, o.quaternion);
     }
-
-    if (this.terrainMeshId)
-      this.writeObject(
-        TERRAIN_SLOT,
-        [1, 1, 1],
-        [0, 0, 0],
-        [1, 1, 1, 1],
-        [0, 0, 0, 1],
-      );
 
     pass.setBindGroup(0, this.frameBindGroup);
 
     if (this.terrainMeshId) {
       const mesh = this.meshRegistry.get(this.terrainMeshId);
       if (mesh) {
-        pass.setPipeline(this.meshPipeline);
-        pass.setBindGroup(1, this.objectBindGroup, [
-          TERRAIN_SLOT * this.objectStride,
+        const tData = new Float32Array([
+          this.boundsQuat[0],
+          this.boundsQuat[1],
+          this.boundsQuat[2],
+          this.boundsQuat[3],
+          this.time,
+          this.waterLevel,
+          this.causticStrength,
+          this.fogDensity,
         ]);
+        this.device.queue.writeBuffer(this.terrainUniform, 0, tData);
+
+        pass.setPipeline(this.terrainPipeline);
+        pass.setBindGroup(1, this.terrainBindGroup);
         pass.setVertexBuffer(0, mesh.vertex);
         pass.setIndexBuffer(mesh.index, "uint32");
         pass.drawIndexed(mesh.indexCount);
@@ -623,12 +853,11 @@ export class SceneRenderer {
     }
 
     for (let i = 0; i < this.objectVisuals.length; i++) {
-      if (i >= TERRAIN_SLOT) break;
-
       const o = this.objectVisuals[i];
       if (!o.visible) continue;
 
-      pass.setBindGroup(1, this.objectBindGroup, [i * this.objectStride]);
+      const slot = 3 + i;
+      pass.setBindGroup(1, this.objectBindGroup, [slot * this.objectStride]);
 
       const mesh =
         o.shape === "mesh" && o.meshId ? this.meshRegistry.get(o.meshId) : null;

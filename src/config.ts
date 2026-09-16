@@ -14,28 +14,40 @@ export interface SimulationPreset {
 }
 
 export const PRESETS: Record<string, SimulationPreset> = {
-  Water: {
+  "Standard Water": {
     name: "Water",
     gravity: 14.0,
     collisionDamping: 0,
     targetDensity: 6.0,
-    pressureMultiplier: 5.0,
-    nearDensityMultiplier: 20.0,
-    smoothingRadius: 0.35,
-    viscosityStrength: 0.18,
-    particleSpacing: 0.01,
+    pressureMultiplier: 60.0,
+    nearDensityMultiplier: 25.0,
+    smoothingRadius: 0.95,
+    viscosityStrength: 0.3,
+    particleSpacing: 0.04,
     substeps: 1,
   },
   "Slimey Liquid": {
     name: "Slimey Liquid",
     gravity: 9.81,
     collisionDamping: 0,
-    targetDensity: 7.0,
-    pressureMultiplier: 10.0,
-    nearDensityMultiplier: 25.0,
-    smoothingRadius: 0.38,
-    viscosityStrength: 3.5,
-    particleSpacing: 0.01,
+    targetDensity: 8.0,
+    pressureMultiplier: 80.0,
+    nearDensityMultiplier: 40.0,
+    smoothingRadius: 1.0,
+    viscosityStrength: 18.0,
+    particleSpacing: 0.04,
+    substeps: 1,
+  },
+  "Zero-G Fluid Bubble": {
+    name: "Zero-G Fluid Bubble",
+    gravity: 0.0,
+    collisionDamping: 0,
+    targetDensity: 5.5,
+    pressureMultiplier: 45.0,
+    nearDensityMultiplier: 50.0,
+    smoothingRadius: 1.1,
+    viscosityStrength: 2.0,
+    particleSpacing: 0.04,
     substeps: 1,
   },
 };
@@ -53,6 +65,7 @@ export interface ObjectSlotConfig {
   size: number;
   autoSpin: boolean;
   spinSpeed: number;
+
   physics: boolean;
   densityRatio: number;
   drag: number;
@@ -90,53 +103,86 @@ export const config = {
   collisionDamping: 0,
 
   targetDensity: 6.0,
-  pressureMultiplier: 5.0,
-  nearDensityMultiplier: 20.0,
-  smoothingRadius: 0.35,
-  viscosityStrength: 0.18,
+  pressureMultiplier: 60.0,
+  nearDensityMultiplier: 25.0,
+  smoothingRadius: 0.95,
+  viscosityStrength: 0.3,
 
-  numParticles: 8192,
+  numParticles: 4096,
   maxParticles: 42768,
-  particleSize: 0.1,
-  particleSpacing: 0.01,
+  particleSize: 0.22,
+  particleSpacing: 0.04,
   xsphStrength: 0.15,
 
-  planetRadius: 20.0,
-  planetHeightScale: 2.5,
-  planetNoiseScale: 2.5,
-  planetFaceResolution: 128,
-  planetSeed: 1,
-  planetCenterX: 0,
-  planetCenterY: 0,
-  planetCenterZ: 0,
+  boundsWidth: 14,
+  boundsHeight: 14,
+  boundsDepth: 14,
 
-  objects: [makeObjectSlot({ type: "none", posX: 0, posY: 25, size: 1.5 })],
+  boundsRotationX: 0,
+  boundsRotationY: 0,
+  boundsRotationZ: 0,
+  boundsAutoTumble: false,
+
+  objects: [
+    makeObjectSlot({ type: "none", posX: 3.5, size: 1.5 }),
+  ] as ObjectSlotConfig[],
 
   interactionRadius: 5.0,
-  interactionStrength: 10.0,
+  interactionStrength: 80.0,
 
   minSpeed: 0.0,
   maxSpeed: 12.0,
+
+  terrainEnabled: true,
+  terrainResolution: 128,
+  terrainHeightScale: 3.0,
+  terrainSeed: 1,
 };
 
 export function setupGUI(
   onResetParticles: () => void,
+  onUpdateBounds: () => void,
   onUpdateParticleSize: (size: number) => void,
   onObjectChanged: (index: number) => void,
   onSpawnObject: (index: number) => void,
-  onRegeneratePlanet: () => void,
+  onRegenerateTerrain: () => void,
 ): GUI {
   const gui = new GUI({ title: "Fluid Simulation" });
 
   addPresetFolder(gui, onResetParticles);
   addSimulationFolder(gui);
+  addContainerFolder(gui, onUpdateBounds);
   addSPHFolder(gui);
   addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
-  addPlanetFolder(gui, onRegeneratePlanet);
+  addTerrainFolder(gui, onRegenerateTerrain);
   addVisualsFolder(gui);
 
   return gui;
+}
+
+function addTerrainFolder(gui: GUI, onRegen: () => void): void {
+  const folder = gui.addFolder("Terrain");
+  folder.add(config, "terrainEnabled").name("Enabled").onChange(onRegen);
+  folder
+    .add(config, "terrainResolution", 32, 512, 32)
+    .name("Resolution")
+    .onChange(onRegen);
+  folder
+    .add(config, "terrainHeightScale", 0.5, 8, 0.1)
+    .name("Height Scale")
+    .onChange(onRegen);
+  folder
+    .add(
+      {
+        regen: () => {
+          config.terrainSeed = Math.floor(Math.random() * 100000);
+          onRegen();
+        },
+      },
+      "regen",
+    )
+    .name("Regenerate");
 }
 
 function addPresetFolder(gui: GUI, onResetParticles: () => void): void {
@@ -167,21 +213,41 @@ function addSimulationFolder(gui: GUI): void {
   const folder = gui.addFolder("Simulation Engine");
   folder.add(config, "paused").name("Paused").listen();
   folder.add(config, "substeps", 1, 5, 1).name("Substeps");
-  folder.add(config, "gravity", 0, 40, 0.5).name("Gravity");
-  folder.add(config, "collisionDamping", 0, 1, 0.05).name("Restitution");
+  folder.add(config, "gravity", -40, 40, 0.5).name("Gravity");
+  folder.add(config, "collisionDamping", 0, 1, 0.05).name("Wall Restitution");
+}
+
+function addContainerFolder(gui: GUI, onUpdateBounds: () => void): void {
+  const folder = gui.addFolder("Container");
+  folder.add(config, "boundsAutoTumble").name("Auto rotate");
+  folder.add(config, "boundsRotationX", -180, 180, 1).name("Tilt X");
+  folder.add(config, "boundsRotationY", -180, 180, 1).name("Tilt Y");
+  folder.add(config, "boundsRotationZ", -180, 180, 1).name("Tilt Z");
+  folder
+    .add(config, "boundsWidth", 4, 40, 1)
+    .name("Width")
+    .onChange(onUpdateBounds);
+  folder
+    .add(config, "boundsHeight", 4, 40, 1)
+    .name("Height")
+    .onChange(onUpdateBounds);
+  folder
+    .add(config, "boundsDepth", 4, 40, 1)
+    .name("Depth")
+    .onChange(onUpdateBounds);
 }
 
 function addSPHFolder(gui: GUI): void {
   const folder = gui.addFolder("SPH Parameters");
   folder.add(config, "targetDensity", 1, 30, 0.5).name("Target Density");
   folder
-    .add(config, "pressureMultiplier", 5, 300, 5)
+    .add(config, "pressureMultiplier", 10, 300, 5)
     .name("Pressure Multiplier");
   folder.add(config, "nearDensityMultiplier", 0, 200, 5).name("Near Pressure");
   folder
-    .add(config, "smoothingRadius", 0.1, 2.0, 0.01)
+    .add(config, "smoothingRadius", 0.3, 2.0, 0.02)
     .name("Smoothing Radius");
-  folder.add(config, "viscosityStrength", 0.0, 10.0, 0.05).name("Viscosity");
+  folder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
 }
 
 function addParticleFolder(
@@ -195,15 +261,15 @@ function addParticleFolder(
     .name("Particle Count")
     .onChange(onResetParticles);
   folder
-    .add(config, "particleSize", 0.02, 0.4, 0.005)
+    .add(config, "particleSize", 0.05, 0.6, 0.01)
     .name("Visual Radius")
     .onChange(onUpdateParticleSize);
   folder
-    .add(config, "particleSpacing", 0.0, 0.1, 0.005)
-    .name("Particle Spacing")
+    .add(config, "particleSpacing", 0.0, 0.2, 0.005)
+    .name("Initial Spacing")
     .onChange(onResetParticles);
-  folder.add(config, "interactionRadius", 1, 10, 0.5).name("Mouse Radius");
-  folder.add(config, "interactionStrength", 1, 100, 5).name("Mouse Strength");
+  folder.add(config, "interactionRadius", 1, 15, 0.5).name("Mouse Radius");
+  folder.add(config, "interactionStrength", 5, 300, 5).name("Mouse Strength");
 }
 
 function addObjectFolders(
@@ -218,9 +284,9 @@ function addObjectFolders(
       .name("Shape")
       .onChange(() => onObjectChanged(index));
     folder.add(slot, "size", 0.5, 4, 0.1).name("Size");
-    folder.add(slot, "posX", -50, 50, 0.1).name("Position X");
-    folder.add(slot, "posY", -50, 50, 0.1).name("Position Y");
-    folder.add(slot, "posZ", -50, 50, 0.1).name("Position Z");
+    folder.add(slot, "posX", -24, 24, 0.1).name("Position X");
+    folder.add(slot, "posY", -24, 24, 0.1).name("Position Y");
+    folder.add(slot, "posZ", -24, 24, 0.1).name("Position Z");
     folder.add(slot, "rotX", -180, 180, 1).name("Rotation X");
     folder.add(slot, "rotY", -180, 180, 1).name("Rotation Y");
     folder.add(slot, "rotZ", -180, 180, 1).name("Rotation Z");
@@ -238,37 +304,6 @@ function addObjectFolders(
     folder.add(slot, "angularDrag", 0, 20, 0.1).name("Angular Drag");
     folder.add({ spawn: () => onSpawnObject(index) }, "spawn").name("Spawn");
   });
-}
-
-function addPlanetFolder(gui: GUI, onRegen: () => void): void {
-  const folder = gui.addFolder("Planet");
-  folder
-    .add(config, "planetRadius", 5, 60, 0.5)
-    .name("Radius")
-    .onChange(onRegen);
-  folder
-    .add(config, "planetHeightScale", 0.5, 8, 0.1)
-    .name("Relief")
-    .onChange(onRegen);
-  folder
-    .add(config, "planetNoiseScale", 0.5, 8, 0.1)
-    .name("Feature Scale")
-    .onChange(onRegen);
-  folder
-    .add(config, "planetFaceResolution", 32, 512, 32)
-    .name("Face Res")
-    .onChange(onRegen);
-  folder
-    .add(
-      {
-        regen: () => {
-          config.planetSeed = Math.floor(Math.random() * 100000);
-          onRegen();
-        },
-      },
-      "regen",
-    )
-    .name("Regenerate");
 }
 
 function addVisualsFolder(gui: GUI): void {
