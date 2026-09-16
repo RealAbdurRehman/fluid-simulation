@@ -2,8 +2,8 @@ import * as THREE from "three";
 
 import { config, setupGUI } from "./config";
 import { FluidSimulationGPU } from "./simulation";
-import { GPUParticleRenderer } from "./renderer";
 import { SceneRenderer } from "./sceneRenderer";
+import { SSFRRenderer } from "./ssfrRenderer";
 import { camera, attachControls, resizeCamera } from "./scene";
 import { MeshRegistry } from "./meshRegistry";
 import { createSimUpdaters } from "./simUpdaters";
@@ -24,17 +24,14 @@ async function bootstrap(): Promise<void> {
   const controls = attachControls(canvas);
 
   const sceneRenderer = new SceneRenderer(device, format);
-  const particleRenderer = new GPUParticleRenderer(
+
+  const ssfr = new SSFRRenderer(
     device,
-    simulation.getParticlesBuffer(),
     format,
+    simulation.getParticlesBuffer(),
   );
 
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
-  meshRegistry.register(
-    "torusKnot",
-    new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
-  );
   meshRegistry.register(
     "torusKnot",
     new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
@@ -103,6 +100,7 @@ async function bootstrap(): Promise<void> {
     canvas.height = Math.max(1, Math.floor(h * dpr));
     resizeCamera();
     sceneRenderer.resize(canvas.width, canvas.height);
+    ssfr.resize(canvas.width, canvas.height);
   }
 
   resize();
@@ -136,48 +134,29 @@ async function bootstrap(): Promise<void> {
 
     const encoder = device.createCommandEncoder();
 
+    // --- Simulation ---
     if (stepOnce) {
       stepOnce = false;
       accumulator = 0;
       updaters.updateBoundsRotation(FIXED_DELTA);
       updaters.updateObjects(FIXED_DELTA);
       simulation.recordStepCommands(encoder, FIXED_DELTA);
-    } else if (!config.paused)
+    } else if (!config.paused) {
       while (accumulator >= FIXED_DELTA) {
         accumulator -= FIXED_DELTA;
         updaters.updateBoundsRotation(FIXED_DELTA);
         updaters.updateObjects(FIXED_DELTA);
         simulation.recordStepCommands(encoder, FIXED_DELTA);
       }
-    else accumulator = 0;
+    } else {
+      accumulator = 0;
+    }
 
-    sceneRenderer.updateFrame(viewState.viewProj, [
-      camera.position.x,
-      camera.position.y,
-      camera.position.z,
-    ]);
+    // --- SSFR uniforms ---
+    const aspect = canvas.width / canvas.height;
+    const tanHalfFovY = Math.tan((camera.fov * Math.PI) / 360);
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: sceneRenderer.getMSAAView(),
-          resolveTarget: context.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "discard",
-        },
-      ],
-      depthStencilAttachment: {
-        view: sceneRenderer.getDepthView(),
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "discard",
-      },
-    });
-
-    sceneRenderer.encode(pass);
-    particleRenderer.encode(
-      pass,
+    ssfr.updateFrame(
       viewState.view,
       viewState.proj,
       [
@@ -186,10 +165,108 @@ async function bootstrap(): Promise<void> {
         viewState.cameraRight.z,
       ],
       [viewState.cameraUp.x, viewState.cameraUp.y, viewState.cameraUp.z],
-      config.numParticles,
+      camera.near,
+      camera.far,
+      tanHalfFovY,
+      aspect,
     );
 
-    pass.end();
+    // --- Scene uniforms ---
+    sceneRenderer.time = timer.getElapsed();
+    sceneRenderer.waterLevel = -1.0;
+    sceneRenderer.updateFrame(viewState.viewProj, [
+      camera.position.x,
+      camera.position.y,
+      camera.position.z,
+    ]);
+
+    // --- Pass 1: scene (sky + terrain + objects) to offscreen ---
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getSceneColorView(),
+            clearValue: { r: 0.02, g: 0.05, b: 0.1, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+        depthStencilAttachment: {
+          view: ssfr.getSceneDepthView(),
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+        },
+      });
+      sceneRenderer.encode(pass);
+      pass.end();
+    }
+
+    // --- Pass 2: particle depth ---
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getFluidDepthView(),
+            clearValue: { r: ssfr.getFarDepth(), g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+        depthStencilAttachment: {
+          view: ssfr.getFluidDepthStencilView(),
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "discard",
+        },
+      });
+      ssfr.encodeParticleDepth(pass, config.numParticles);
+      pass.end();
+    }
+
+    // --- Pass 3: particle thickness ---
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getFluidThicknessView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      ssfr.encodeParticleThickness(pass, config.numParticles);
+      pass.end();
+    }
+
+    // --- Pass 4 + 5: bilateral filter (horizontal then vertical) ---
+    {
+      const pass = encoder.beginComputePass();
+      ssfr.encodeBilateralH(pass);
+      pass.end();
+    }
+    {
+      const pass = encoder.beginComputePass();
+      ssfr.encodeBilateralV(pass);
+      pass.end();
+    }
+
+    // --- Pass 6: composite to canvas ---
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      ssfr.encodeComposite(pass);
+      pass.end();
+    }
 
     device.queue.submit([encoder.finish()]);
     requestAnimationFrame(animate);

@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { acesFilmicWGSL } from "./shader/common.wgsl";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
-const SAMPLE_COUNT = 4;
+const SAMPLE_COUNT = 1;
 const MAX_OBJECT_SLOTS = 16;
 
 const sceneShaderWGSL = /* wgsl */ `
@@ -543,7 +543,7 @@ export class SceneRenderer {
     });
 
     const depthStencil: GPUDepthStencilState = {
-      format: "depth24plus",
+      format: "depth32float",
       depthWriteEnabled: true,
       depthCompare: "less",
     };
@@ -576,7 +576,7 @@ export class SceneRenderer {
         targets: [{ format: this.format }],
       },
       depthStencil: {
-        format: "depth24plus",
+        format: "depth32float",
         depthWriteEnabled: false,
         depthCompare: "always",
       },
