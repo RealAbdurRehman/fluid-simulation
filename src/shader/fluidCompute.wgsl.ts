@@ -116,13 +116,13 @@ fn getKeyFromHash(hash: u32, tableSize: u32) -> u32 {
 fn densityKernel(radius: f32, dist: f32) -> f32 {
   if (dist >= radius) { return 0.0; }
   let v = radius - dist;
-  return v * v * params.poly6Factor;
+  return v * v * v * params.poly6Factor;
 }
 
 fn nearDensityKernel(radius: f32, dist: f32) -> f32 {
   if (dist >= radius) { return 0.0; }
   let v = radius - dist;
-  return v * v * v * params.nearSpikyGradFactor;
+  return v * v * v * v * params.nearSpikyGradFactor;
 }
 
 fn densityToPressure(density: f32) -> f32 {
@@ -135,13 +135,14 @@ fn nearDensityToPressure(nearDensity: f32) -> f32 {
 
 fn densityKernelDerivative(radius: f32, dist: f32) -> f32 {
   if (dist >= radius) { return 0.0; }
-  return (dist - radius) * params.spikyGradFactor;
+  let v = radius - dist;
+  return -v * v * params.spikyGradFactor;
 }
 
 fn nearDensityKernelDerivative(radius: f32, dist: f32) -> f32 {
   if (dist >= radius) { return 0.0; }
   let v = radius - dist;
-  return -v * v * params.nearSpikyGradFactor;
+  return -v * v * v * params.nearSpikyGradFactor;
 }
 
 fn viscosityKernel(radius: f32, dist: f32) -> f32 {
@@ -412,8 +413,7 @@ fn resolvePlanetTerrain(posIn: vec3<f32>, velIn: vec3<f32>, radius: f32) -> Coll
     }
 
     let vt = v - n * dot(v, n);
-    let steep = 1.0 - dot(n, dir);
-    let friction = 0.025 * (1.0 - clamp(steep * 3.0, 0.0, 0.9));
+    let friction = clamp(0.05 * params.deltaTime, 0.0, 0.01);
     v = v - vt * friction;
 
     r.velocity = v;
@@ -602,8 +602,7 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let radiusSqr = radius * radius;
 
   var pressureForce = vec3<f32>(0.0);
-  var viscDelta = vec3<f32>(0.0);
-  var viscWeightSum = 0.0;
+  var viscForce = vec3<f32>(0.0);
 
   for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
     for (var offsetY = -1; offsetY <= 1; offsetY++) {
@@ -648,8 +647,7 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
 
               let neighborVel = particles[neighborIndex].velocity.xyz;
               let w = viscosityKernel(radius, dist);
-              viscDelta += (neighborVel - vel) * w;
-              viscWeightSum += w;
+              viscForce += (neighborVel - vel) * w * (params.particleMass / max(neighborDensity, 0.001));
             }
           }
         }
@@ -659,40 +657,18 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
 
   var pressureAccel = pressureForce / max(density, 0.001);
   let accelLen = length(pressureAccel);
-  let maxAccel = 400.0;
+  let maxAccel = 800.0;
   if (accelLen > maxAccel) {
     pressureAccel *= maxAccel / accelLen;
   }
 
-  let radialUp = normalize(pos - params.planetCenter.xyz);
-  let upComponent = dot(pressureAccel, radialUp);
-  let maxUpwardAccel = max(params.gravity * 3.5, 60.0);
-
-  if (upComponent > maxUpwardAccel) {
-    pressureAccel = pressureAccel - radialUp * (upComponent - maxUpwardAccel);
-  }
-
   let totalAcceleration = select(
-    pressureAccel,
+    pressureAccel + viscForce * params.viscosityStrength,
     vec3<f32>(0.0),
     density <= 0.0,
   );
 
   var newVel = vel + totalAcceleration * params.deltaTime;
-
-  if (viscWeightSum > 0.0) {
-    let avgRelVel = viscDelta / viscWeightSum;
-    let blend = clamp(params.viscosityStrength * params.deltaTime * 3.0, 0.0, 0.8);
-    newVel += avgRelVel * blend;
-  }
-
-  let speed = length(newVel);
-  let lowSpeed = clamp(speed * 12.0, 0.0, 1.0);
-  let stiction = 1.0 - params.deltaTime * 3.0 * (1.0 - lowSpeed);
-  newVel *= max(0.0, stiction);
-
-  let viscDamp = max(0.0, 1.0 - params.viscosityStrength * 0.15 * params.deltaTime);
-  newVel *= viscDamp;
 
   particles[index].velocity = vec4<f32>(newVel, 0.0);
 }

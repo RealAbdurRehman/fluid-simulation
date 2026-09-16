@@ -365,7 +365,7 @@ export class FluidSimulationGPU {
     const T = new THREE.Vector3().crossVectors(upRef, D).normalize();
     const B = new THREE.Vector3().crossVectors(D, T).normalize();
 
-    const centerAlt = R + hs + halfExtent + 1.5;
+    const centerAlt = R + hs + halfExtent + 1.0;
     for (let i = 0; i < n; i++) {
       const ix = i % perAxis;
       const iz = Math.floor(i / perAxis) % perAxis;
@@ -623,8 +623,9 @@ export class FluidSimulationGPU {
     this.writeColliders();
 
     const r = config.smoothingRadius;
-    const r6 = Math.pow(r, 6);
-    const r9 = Math.pow(r, 9);
+    const r3 = r * r * r;
+    const r4 = r3 * r;
+    const r2 = r * r;
 
     const buffer = new ArrayBuffer(192);
     const f32 = new Float32Array(buffer);
@@ -657,11 +658,11 @@ export class FluidSimulationGPU {
 
     f32[20] = config.interactionRadius;
     f32[21] = this.interactionStrength;
-    f32[22] = 315 / (64 * Math.PI * r9);
-    f32[23] = 45 / (Math.PI * r6);
+    f32[22] = 1.0 / r3;
+    f32[23] = 3.0 / r3;
 
-    f32[24] = 45 / (Math.PI * r6);
-    f32[25] = 45 / (Math.PI * r6);
+    f32[24] = 4.0 / r4;
+    f32[25] = 1.0 / r2;
     u32[26] = this.numColliders;
     u32[27] = this.probeCount;
 

@@ -19,23 +19,23 @@ export const PRESETS: Record<string, SimulationPreset> = {
     gravity: 14.0,
     collisionDamping: 0,
     targetDensity: 6.0,
-    pressureMultiplier: 60.0,
-    nearDensityMultiplier: 25.0,
-    smoothingRadius: 0.95,
-    viscosityStrength: 1.2,
-    particleSpacing: 0.04,
+    pressureMultiplier: 5.0,
+    nearDensityMultiplier: 20.0,
+    smoothingRadius: 0.35,
+    viscosityStrength: 0.18,
+    particleSpacing: 0.01,
     substeps: 1,
   },
   "Slimey Liquid": {
     name: "Slimey Liquid",
     gravity: 9.81,
     collisionDamping: 0,
-    targetDensity: 8.0,
-    pressureMultiplier: 80.0,
-    nearDensityMultiplier: 40.0,
-    smoothingRadius: 1.0,
-    viscosityStrength: 18.0,
-    particleSpacing: 0.04,
+    targetDensity: 7.0,
+    pressureMultiplier: 10.0,
+    nearDensityMultiplier: 25.0,
+    smoothingRadius: 0.38,
+    viscosityStrength: 3.5,
+    particleSpacing: 0.01,
     substeps: 1,
   },
 };
@@ -90,15 +90,15 @@ export const config = {
   collisionDamping: 0,
 
   targetDensity: 6.0,
-  pressureMultiplier: 60.0,
-  nearDensityMultiplier: 25.0,
-  smoothingRadius: 0.95,
-  viscosityStrength: 1.2,
+  pressureMultiplier: 5.0,
+  nearDensityMultiplier: 20.0,
+  smoothingRadius: 0.35,
+  viscosityStrength: 0.18,
 
   numParticles: 8192,
   maxParticles: 42768,
-  particleSize: 0.22,
-  particleSpacing: 0.04,
+  particleSize: 0.1,
+  particleSpacing: 0.01,
   xsphStrength: 0.15,
 
   planetRadius: 20.0,
@@ -113,7 +113,7 @@ export const config = {
   objects: [makeObjectSlot({ type: "none", posX: 0, posY: 25, size: 1.5 })],
 
   interactionRadius: 5.0,
-  interactionStrength: 40.0,
+  interactionStrength: 10.0,
 
   minSpeed: 0.0,
   maxSpeed: 12.0,
@@ -175,13 +175,13 @@ function addSPHFolder(gui: GUI): void {
   const folder = gui.addFolder("SPH Parameters");
   folder.add(config, "targetDensity", 1, 30, 0.5).name("Target Density");
   folder
-    .add(config, "pressureMultiplier", 10, 300, 5)
+    .add(config, "pressureMultiplier", 5, 300, 5)
     .name("Pressure Multiplier");
   folder.add(config, "nearDensityMultiplier", 0, 200, 5).name("Near Pressure");
   folder
-    .add(config, "smoothingRadius", 0.3, 2.0, 0.02)
+    .add(config, "smoothingRadius", 0.1, 2.0, 0.01)
     .name("Smoothing Radius");
-  folder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
+  folder.add(config, "viscosityStrength", 0.0, 10.0, 0.05).name("Viscosity");
 }
 
 function addParticleFolder(
@@ -195,9 +195,13 @@ function addParticleFolder(
     .name("Particle Count")
     .onChange(onResetParticles);
   folder
-    .add(config, "particleSize", 0.05, 0.6, 0.01)
+    .add(config, "particleSize", 0.02, 0.4, 0.005)
     .name("Visual Radius")
     .onChange(onUpdateParticleSize);
+  folder
+    .add(config, "particleSpacing", 0.0, 0.1, 0.005)
+    .name("Particle Spacing")
+    .onChange(onResetParticles);
   folder.add(config, "interactionRadius", 1, 10, 0.5).name("Mouse Radius");
   folder.add(config, "interactionStrength", 1, 100, 5).name("Mouse Strength");
 }
