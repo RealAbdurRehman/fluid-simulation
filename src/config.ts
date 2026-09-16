@@ -16,14 +16,14 @@ export interface SimulationPreset {
 export const PRESETS: Record<string, SimulationPreset> = {
   "Standard Water": {
     name: "Water",
-    gravity: 14.0,
+    gravity: 16.0,
     collisionDamping: 0,
     targetDensity: 6.0,
-    pressureMultiplier: 60.0,
-    nearDensityMultiplier: 25.0,
+    pressureMultiplier: 65.0,
+    nearDensityMultiplier: 30.0,
     smoothingRadius: 0.95,
-    viscosityStrength: 0.3,
-    particleSpacing: 0.04,
+    viscosityStrength: 0.4,
+    particleSpacing: 0.05,
     substeps: 1,
   },
   "Slimey Liquid": {
@@ -95,28 +95,28 @@ function makeObjectSlot(
 }
 
 export const config = {
-  preset: "Water",
+  preset: "Standard Water",
 
   paused: false,
   substeps: 1,
-  gravity: 14.0,
+  gravity: 16.0,
   collisionDamping: 0,
 
   targetDensity: 6.0,
-  pressureMultiplier: 60.0,
-  nearDensityMultiplier: 25.0,
+  pressureMultiplier: 65.0,
+  nearDensityMultiplier: 30.0,
   smoothingRadius: 0.95,
-  viscosityStrength: 0.3,
+  viscosityStrength: 0.4,
 
-  numParticles: 4096,
+  numParticles: 22768,
   maxParticles: 42768,
-  particleSize: 0.22,
-  particleSpacing: 0.04,
+  particleSize: 0.2,
+  particleSpacing: 0.05,
   xsphStrength: 0.15,
 
-  boundsWidth: 14,
-  boundsHeight: 14,
-  boundsDepth: 14,
+  boundsWidth: 24,
+  boundsHeight: 30,
+  boundsDepth: 24,
 
   boundsRotationX: 0,
   boundsRotationY: 0,
@@ -124,18 +124,39 @@ export const config = {
   boundsAutoTumble: false,
 
   objects: [
-    makeObjectSlot({ type: "none", posX: 3.5, size: 1.5 }),
+    makeObjectSlot({
+      type: "sphere",
+      posX: -3.5,
+      posY: 0.5,
+      posZ: 0.5,
+      size: 1.2,
+      physics: true,
+      densityRatio: 2.5,
+      drag: 3.0,
+      angularDrag: 2.0,
+    }),
+    makeObjectSlot({
+      type: "box",
+      posX: 3.0,
+      posY: 2.5,
+      posZ: -1.0,
+      size: 0.9,
+      physics: true,
+      densityRatio: 0.25,
+      drag: 6.0,
+      angularDrag: 3.0,
+    }),
   ] as ObjectSlotConfig[],
 
   interactionRadius: 5.0,
   interactionStrength: 80.0,
 
   minSpeed: 0.0,
-  maxSpeed: 12.0,
+  maxSpeed: 10.0,
 
   terrainEnabled: true,
   terrainResolution: 128,
-  terrainHeightScale: 3.0,
+  terrainHeightScale: 2.5,
   terrainSeed: 1,
 };
 
@@ -169,7 +190,7 @@ function addTerrainFolder(gui: GUI, onRegen: () => void): void {
     .name("Resolution")
     .onChange(onRegen);
   folder
-    .add(config, "terrainHeightScale", 0.5, 8, 0.1)
+    .add(config, "terrainHeightScale", 0.5, 30, 0.1)
     .name("Height Scale")
     .onChange(onRegen);
   folder
