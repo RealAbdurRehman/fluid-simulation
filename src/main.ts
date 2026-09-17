@@ -134,7 +134,6 @@ async function bootstrap(): Promise<void> {
 
     const encoder = device.createCommandEncoder();
 
-    // --- Simulation ---
     if (stepOnce) {
       stepOnce = false;
       accumulator = 0;
@@ -152,7 +151,8 @@ async function bootstrap(): Promise<void> {
       accumulator = 0;
     }
 
-    // --- SSFR uniforms ---
+    ssfr.time = timer.getElapsed();
+
     const aspect = canvas.width / canvas.height;
     const tanHalfFovY = Math.tan((camera.fov * Math.PI) / 360);
 
@@ -171,7 +171,6 @@ async function bootstrap(): Promise<void> {
       aspect,
     );
 
-    // --- Scene uniforms ---
     sceneRenderer.time = timer.getElapsed();
     sceneRenderer.waterLevel = -1.0;
     sceneRenderer.updateFrame(viewState.viewProj, [
@@ -180,7 +179,6 @@ async function bootstrap(): Promise<void> {
       camera.position.z,
     ]);
 
-    // --- Pass 1: scene (sky + terrain + objects) to offscreen ---
     {
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -202,7 +200,6 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
-    // --- Pass 2: particle depth ---
     {
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -224,7 +221,6 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
-    // --- Pass 3: particle thickness ---
     {
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -240,7 +236,6 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
-    // --- Pass 4 + 5: bilateral filter (horizontal then vertical) ---
     {
       const pass = encoder.beginComputePass();
       ssfr.encodeBilateralH(pass);
@@ -252,7 +247,6 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
-    // --- Pass 6: composite to canvas ---
     {
       const pass = encoder.beginRenderPass({
         colorAttachments: [

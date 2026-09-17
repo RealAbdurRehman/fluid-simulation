@@ -110,7 +110,7 @@ export const config = {
 
   numParticles: 22768,
   maxParticles: 42768,
-  particleSize: 0.2,
+  particleSize: 0.4,
   particleSpacing: 0.05,
   xsphStrength: 0.15,
 
@@ -122,6 +122,8 @@ export const config = {
   boundsRotationY: 0,
   boundsRotationZ: 0,
   boundsAutoTumble: false,
+
+  renderSplatScale: 1.35,
 
   objects: [
     makeObjectSlot({
