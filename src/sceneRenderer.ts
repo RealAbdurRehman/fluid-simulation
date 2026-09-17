@@ -219,6 +219,7 @@ struct VOut {
   @location(0) worldPos: vec3<f32>,
   @location(1) worldNormal: vec3<f32>,
   @location(2) localPos: vec3<f32>,
+  @location(3) localNormal: vec3<f32>,
 };
 
 @vertex
@@ -230,18 +231,19 @@ fn terrain_vs(input: VIn) -> VOut {
   out.worldPos = world;
   out.worldNormal = worldN;
   out.localPos = input.position;
+  out.localNormal = input.normal;
   return out;
 }
 
 @fragment
 fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
   let n = normalize(input.worldNormal);
-  let up = max(n.y, 0.0);
+  let localN = normalize(input.localNormal);
+  let up = max(localN.y, 0.0);
   let slope = 1.0 - up;
 
   let wp3 = input.localPos;
   let wp = wp3.xz;
-  let t = terrain.time;
 
   let sandLight = vec3<f32>(0.96, 0.90, 0.76);
   let sandMid   = vec3<f32>(0.86, 0.77, 0.60);
@@ -262,18 +264,18 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
   albedo *= mix(vec3<f32>(1.0), warmTint, warmAmt);
   albedo *= mix(vec3<f32>(1.0), coolTint, coolAmt);
 
-  let warpA = fbm(wp * 0.55 + vec2<f32>(t * 0.06, t * 0.04), 3);
-  let phaseA = (wp.x * 0.85 + wp.y * 0.50) * 8.0 + warpA * 10.0 + t * 0.20;
+  let warpA = fbm(wp * 0.55, 3);
+  let phaseA = (wp.x * 0.85 + wp.y * 0.50) * 8.0 + warpA * 10.0;
   let rippleA = sin(phaseA) * 0.5 + 0.5;
 
-  let warpB = fbm(wp * 0.80 + vec2<f32>(-t * 0.05, t * 0.07) + 30.0, 3);
-  let phaseB = (wp.x * -0.45 + wp.y * 0.95) * 13.0 + warpB * 7.0 + t * 0.14;
+  let warpB = fbm(wp * 0.80 + 30.0, 3);
+  let phaseB = (wp.x * -0.45 + wp.y * 0.95) * 13.0 + warpB * 7.0;
   let rippleB = sin(phaseB) * 0.5 + 0.5;
 
   let regionMask = smoothstep(
     0.35,
     0.65,
-    fbm(wp * 0.06 + vec2<f32>(t * 0.008, -t * 0.006) + 100.0, 3)
+    fbm(wp * 0.06 + 100.0, 3)
   );
   let ripple = mix(rippleA, rippleB, regionMask);
 
@@ -378,7 +380,6 @@ export class SceneRenderer {
   public waterLevel = 0;
   public causticStrength = 0.7;
   public fogDensity = 0.6;
-
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
     this.format = format;
