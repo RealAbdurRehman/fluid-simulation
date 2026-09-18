@@ -89,7 +89,7 @@ async function bootstrap(): Promise<void> {
   regenerateTerrain();
 
   for (let i = 0; i < config.objects.length; i++) {
-    if (config.objects[i].physics && config.objects[i].type !== "none") {
+    if (config.objects[i].type !== "none") {
       updaters.requestBakeForSlot(i);
       updaters.spawnObject(i);
     }

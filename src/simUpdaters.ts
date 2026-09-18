@@ -114,20 +114,6 @@ function createObjectsUpdater(
 ) {
   const slotCount = config.objects.length;
 
-  const spinAngles = new Array<number>(slotCount).fill(0);
-  const prevPositions = Array.from(
-    { length: slotCount },
-    () => new THREE.Vector3(),
-  );
-  const velocities = Array.from(
-    { length: slotCount },
-    () => new THREE.Vector3(),
-  );
-  const quaternions = Array.from(
-    { length: slotCount },
-    () => new THREE.Quaternion(),
-  );
-
   const bodies: (RigidBody | null)[] = new Array(slotCount).fill(null);
 
   const probePositions = new Float32Array(256 * 4);
@@ -151,7 +137,7 @@ function createObjectsUpdater(
 
   function spawnBody(index: number): void {
     const slot = config.objects[index];
-    if (slot.type === "none" || !slot.physics) return;
+    if (slot.type === "none") return;
 
     const shape: ActiveShape = slot.type;
     const volume = bodyVolume(shape, slot.size);
@@ -177,51 +163,22 @@ function createObjectsUpdater(
       drag: slot.drag,
       angularDrag: slot.angularDrag,
     });
-
-    prevPositions[index].copy(pos);
-    velocities[index].set(0, 0, 0);
-    quaternions[index].copy(quat);
-    spinAngles[index] = 0;
-  }
-
-  function updateSlotTransform(
-    index: number,
-    slot: ObjectSlotConfig,
-    dt: number,
-  ): THREE.Vector3 {
-    if (slot.autoSpin)
-      spinAngles[index] += THREE.MathUtils.degToRad(slot.spinSpeed) * dt;
-
-    const euler = new THREE.Euler(
-      THREE.MathUtils.degToRad(slot.rotX),
-      THREE.MathUtils.degToRad(slot.rotY) +
-        (slot.autoSpin ? spinAngles[index] : 0),
-      THREE.MathUtils.degToRad(slot.rotZ),
-    );
-    quaternions[index].setFromEuler(euler);
-
-    const position = new THREE.Vector3(slot.posX, slot.posY, slot.posZ);
-    velocities[index]
-      .subVectors(position, prevPositions[index])
-      .divideScalar(Math.max(dt, 1e-4));
-    prevPositions[index].copy(position);
-    return position;
   }
 
   function writeVisual(
     index: number,
     shape: ActiveShape,
     slot: ObjectSlotConfig,
-    position: THREE.Vector3,
+    body: RigidBody,
   ): void {
     const visual = visuals[index];
     visual.visible = true;
-    visual.position = [position.x, position.y, position.z];
+    visual.position = [body.position.x, body.position.y, body.position.z];
     visual.quaternion = [
-      quaternions[index].x,
-      quaternions[index].y,
-      quaternions[index].z,
-      quaternions[index].w,
+      body.quaternion.x,
+      body.quaternion.y,
+      body.quaternion.z,
+      body.quaternion.w,
     ];
 
     visual.scale = slot.size;
@@ -230,16 +187,15 @@ function createObjectsUpdater(
   }
 
   function buildDescriptor(
-    index: number,
     shape: ActiveShape,
     slot: ObjectSlotConfig,
-    position: THREE.Vector3,
+    body: RigidBody,
   ): ObjectDescriptor | null {
     const base: ObjectDescriptor = {
       type: shape === "torusKnot" ? "mesh" : shape,
-      position,
-      quaternion: quaternions[index],
-      velocity: velocities[index],
+      position: body.position,
+      quaternion: body.quaternion,
+      velocity: body.linearVelocity,
       restitution: 0.5,
     };
 
@@ -269,6 +225,7 @@ function createObjectsUpdater(
 
     const g = config.gravity;
     const localRho = Math.max(config.targetDensity, 1e-4);
+
     for (let i = 0; i < slotCount; i++) {
       const slot = config.objects[i];
       if (slot.type === "none") {
@@ -278,20 +235,11 @@ function createObjectsUpdater(
       }
       const shape: ActiveShape = slot.type;
 
-      if (!slot.physics) {
-        bodies[i] = null;
-        const position = updateSlotTransform(i, slot, dt);
-        writeVisual(i, shape, slot, position);
-        const desc = buildDescriptor(i, shape, slot, position);
-        if (desc) descriptors.push(desc);
-        else requestBakeForSlot(i);
-        continue;
-      }
-
       let body = bodies[i];
       if (!body) {
         spawnBody(i);
-        body = bodies[i]!;
+        body = bodies[i];
+        if (!body) continue;
       }
 
       body.drag = slot.drag;
@@ -427,18 +375,11 @@ function createObjectsUpdater(
       body.position.copy(_tmpLocalPos).applyQuaternion(containerQuat);
       body.linearVelocity.copy(_tmpLocalVel).applyQuaternion(containerQuat);
 
-      quaternions[i].copy(body.quaternion);
-      velocities[i].copy(body.linearVelocity);
-      prevPositions[i].copy(body.position);
+      writeVisual(i, shape, slot, body);
 
-      writeVisual(i, shape, slot, body.position);
-
-      const desc = buildDescriptor(i, shape, slot, body.position);
-      if (desc) {
-        desc.quaternion = body.quaternion;
-        desc.velocity = body.linearVelocity;
-        descriptors.push(desc);
-      } else requestBakeForSlot(i);
+      const desc = buildDescriptor(shape, slot, body);
+      if (desc) descriptors.push(desc);
+      else requestBakeForSlot(i);
     }
 
     simulation.setProbes(probePositions, probeCount);

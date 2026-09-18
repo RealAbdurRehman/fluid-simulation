@@ -64,10 +64,6 @@ export interface ObjectSlotConfig {
   rotY: number;
   rotZ: number;
   size: number;
-  autoSpin: boolean;
-  spinSpeed: number;
-
-  physics: boolean;
   densityRatio: number;
   drag: number;
   angularDrag: number;
@@ -85,9 +81,6 @@ function makeObjectSlot(
     rotY: 0,
     rotZ: 0,
     size: 1.5,
-    autoSpin: false,
-    spinSpeed: 30,
-    physics: false,
     densityRatio: 0.5,
     drag: 8.0,
     angularDrag: 4.0,
@@ -181,7 +174,6 @@ export const config = {
       posY: 0.5,
       posZ: 0.5,
       size: 1.2,
-      physics: true,
       densityRatio: 2.5,
       drag: 3.0,
       angularDrag: 2.0,
@@ -192,7 +184,6 @@ export const config = {
       posY: 2.5,
       posZ: -1.0,
       size: 0.9,
-      physics: true,
       densityRatio: 0.25,
       drag: 6.0,
       angularDrag: 3.0,
@@ -325,10 +316,6 @@ function addObjectFolders(
     folder
       .add(slot, "type", ["none", "sphere", "box", "torusKnot"])
       .name("Shape")
-      .onChange(() => onObjectChanged(index));
-    folder
-      .add(slot, "physics")
-      .name("Physics")
       .onChange(() => onObjectChanged(index));
     folder
       .add(slot, "densityRatio", 0.05, 4.0, 0.05)
