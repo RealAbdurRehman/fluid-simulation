@@ -5,6 +5,7 @@ import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const FAR_DEPTH = 1e6;
 const MAX_BILATERAL_RADIUS_PX = 4;
+const LIGHT_MAP_SIZE = 1024;
 
 const particleDepthWGSL = /* wgsl */ `
 struct Particle {
@@ -149,6 +150,80 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 `;
 
+const lightDepthWGSL = /* wgsl */ `
+struct Particle {
+  position: vec4<f32>,
+  predictedPosition: vec4<f32>,
+  velocity: vec4<f32>,
+  density: vec4<f32>,
+};
+
+struct Uniforms {
+  viewMatrix: mat4x4<f32>,
+  projectionMatrix: mat4x4<f32>,
+  cameraRight: vec4<f32>,
+  cameraUp: vec4<f32>,
+  particleScale: f32,
+  _p0: f32,
+  _p1: f32,
+  _p2: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> particles: array<Particle>;
+
+struct VOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) viewZ: f32,
+};
+
+@vertex
+fn vs(
+  @builtin(vertex_index) vi: u32,
+  @builtin(instance_index) ii: u32,
+) -> VOut {
+  var quad = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0),
+  );
+  let p = particles[ii];
+  let uvOffset = quad[vi] * u.particleScale;
+  let worldPos = p.position.xyz
+               + u.cameraRight.xyz * uvOffset.x
+               + u.cameraUp.xyz * uvOffset.y;
+  let viewPos = (u.viewMatrix * vec4<f32>(worldPos, 1.0)).xyz;
+  var out: VOut;
+  out.clip = u.projectionMatrix * vec4<f32>(viewPos, 1.0);
+  out.uv = quad[vi];
+  out.viewZ = -viewPos.z;
+  return out;
+}
+
+struct FOut {
+  @location(0) viewZ: vec4<f32>,
+  @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn fs(in: VOut) -> FOut {
+  var out: FOut;
+  let d2 = dot(in.uv, in.uv);
+  if (d2 > 1.0) { discard; }
+  let sphereZ = u.particleScale * sqrt(max(1.0 - d2, 0.0));
+  let surfaceViewZ = in.viewZ - sphereZ;
+  out.viewZ = vec4<f32>(surfaceViewZ, 0.0, 0.0, 0.0);
+  let viewSpaceZ = -surfaceViewZ;
+  let clip = u.projectionMatrix * vec4<f32>(0.0, 0.0, viewSpaceZ, 1.0);
+  out.depth = clip.z / clip.w;
+  return out;
+}
+`;
+
 const bilateralWGSL = /* wgsl */ `
 struct Params {
   axis: u32,
@@ -232,6 +307,12 @@ struct Uniforms {
   params3: vec4<f32>,
 };
 
+struct LightShadowU {
+  viewProj: mat4x4<f32>,
+  view: mat4x4<f32>,
+  absorb: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var sceneColor: texture_2d<f32>;
 @group(0) @binding(2) var sceneDepth: texture_depth_2d;
@@ -239,6 +320,9 @@ struct Uniforms {
 @group(0) @binding(4) var fluidThickness: texture_2d<f32>;
 @group(0) @binding(5) var linSamp: sampler;
 @group(0) @binding(6) var fluidWorldPos: texture_2d<f32>;
+@group(1) @binding(0) var<uniform> lightU: LightShadowU;
+@group(1) @binding(1) var lightDepthTex: texture_2d<f32>;
+@group(1) @binding(2) var lightThicknessTex: texture_2d<f32>;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -278,6 +362,43 @@ fn projectToUV(viewPos: vec3<f32>) -> vec3<f32> {
   let ndcX = viewPos.x / (aspect * th * safeDepth);
   let ndcY = viewPos.y / (th * safeDepth);
   return vec3<f32>(ndcX * 0.5 + 0.5, 1.0 - (ndcY * 0.5 + 0.5), depth);
+}
+
+fn computeFluidShadow(worldPos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+  let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
+  let nDotL = max(dot(normal, lightDir), 0.0);
+
+  let normalOffset = 0.06 + 0.18 * (1.0 - nDotL);
+  let offsetPos = worldPos + normal * normalOffset;
+
+  let lp = lightU.viewProj * vec4<f32>(offsetPos, 1.0);
+  let w = max(abs(lp.w), 1e-6);
+  let ndc = lp.xyz / w;
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return vec3<f32>(1.0);
+  }
+
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let dims = vec2<f32>(textureDimensions(lightDepthTex));
+  let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+
+  let mapZ = textureLoad(lightDepthTex, px, 0).r;
+  let lv = lightU.view * vec4<f32>(offsetPos, 1.0);
+  let recZ = -lv.z;
+
+  let slopeBias = 0.10 + 0.85 * (1.0 - nDotL) * (1.0 - nDotL);
+  let diff = recZ - mapZ;
+  let shadowAmt = smoothstep(slopeBias, slopeBias + 0.45, diff);
+
+  let rawThickness = textureLoad(lightThicknessTex, px, 0).r;
+  let thickness = min(rawThickness, 3.0);
+  let absorb = exp(-lightU.absorb.rgb * thickness);
+
+  let opaqueAmount = 1.0 - smoothstep(0.0, 0.5, thickness);
+  let occluderColor = mix(absorb, vec3<f32>(0.0), opaqueAmount);
+
+  let tinted = mix(vec3<f32>(1.0), occluderColor, shadowAmt);
+  return max(tinted, vec3<f32>(0.40));
 }
 
 fn hash31(p: vec3<f32>) -> f32 {
@@ -470,6 +591,8 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let thickness = textureLoad(fluidThickness, fluidCoord, 0).r;
   let viewDir = normalize(-reconstructViewPos(in.uv, dC));
 
+  let shadowTint = computeFluidShadow(surfaceWorld, normalSmooth);
+
   let cosTheta = clamp(dot(normalShade, viewDir), 0.0, 1.0);
   let F0 = 0.02;
   let fresnel = min(F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0), 0.85);
@@ -477,7 +600,8 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let baseScatter = u.params3.yzw;
   let deepScatter = baseScatter * 0.22;
   let depthMix = 1.0 - exp(-thickness * 0.22);
-  let scatterColor = mix(baseScatter, deepScatter, depthMix);
+  var scatterColor = mix(baseScatter, deepScatter, depthMix);
+  scatterColor *= mix(vec3<f32>(0.5), vec3<f32>(1.0), shadowTint);
 
   let refrStr = u.params0.z;
   let thicknessGate = smoothstep(2.0, 6.0, thickness);
@@ -540,7 +664,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let halfVS = normalize(sunVS + viewDir);
   let spec = pow(max(dot(normalShade, halfVS), 0.0), u.params1.z);
   let specFacing = smoothstep(0.0, 0.4, facing);
-  col = col + vec3<f32>(1.0, 0.98, 0.92) * spec * 0.6 * edgeFactor * specFacing;
+  col = col + vec3<f32>(1.0, 0.98, 0.92) * spec * 0.6 * edgeFactor * specFacing * shadowTint;
 
   let alpha = clamp((1.0 - exp(-thickness * 1.5)) * edgeFactor, 0.0, 1.0);
   col = mix(sceneCol, col, alpha);
@@ -549,26 +673,51 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 `;
 
+const Z_REMAP = new THREE.Matrix4().set(
+  1,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0.5,
+  0.5,
+  0,
+  0,
+  0,
+  1,
+);
+
 export class SSFRRenderer {
   private device: GPUDevice;
   private format: GPUTextureFormat;
 
   private depthPipeline!: GPURenderPipeline;
   private thicknessPipeline!: GPURenderPipeline;
+  private lightDepthPipeline!: GPURenderPipeline;
   private bilateralHPipeline!: GPUComputePipeline;
   private bilateralVPipeline!: GPUComputePipeline;
   private compositePipeline!: GPURenderPipeline;
 
   private particleUniform!: GPUBuffer;
+  private lightUniform!: GPUBuffer;
   private bilateralParamsH!: GPUBuffer;
   private bilateralParamsV!: GPUBuffer;
   private compositeUniform!: GPUBuffer;
+  private compositeLightUniform!: GPUBuffer;
 
   private depthBindGroup!: GPUBindGroup;
   private thicknessBindGroup!: GPUBindGroup;
+  private lightDepthBind!: GPUBindGroup;
+  private lightThicknessBind!: GPUBindGroup;
   private bilateralHBind!: GPUBindGroup;
   private bilateralVBind!: GPUBindGroup;
   private compositeBindGroup!: GPUBindGroup;
+  private compositeLightBind!: GPUBindGroup;
 
   private sceneColorTexture!: GPUTexture;
   private sceneDepthTexture!: GPUTexture;
@@ -578,6 +727,10 @@ export class SSFRRenderer {
   private fluidDepthSmooth!: GPUTexture;
   private fluidThicknessTexture!: GPUTexture;
   private fluidWorldPosTexture!: GPUTexture;
+
+  private lightDepthTexture!: GPUTexture;
+  private lightThicknessTexture!: GPUTexture;
+  private lightDepthStencil!: GPUTexture;
 
   private linearSampler!: GPUSampler;
 
@@ -591,8 +744,12 @@ export class SSFRRenderer {
 
   private fluidScale = 0.5;
 
+  private lightViewProjArray = new Float32Array(16);
+  private lightViewArray = new Float32Array(16);
+
   public time = 0;
   public scatterColor: [number, number, number] = [0.07, 0.16, 0.2];
+  public lightAbsorb: [number, number, number] = [0.85, 0.45, 0.28];
 
   private readonly tmpMat4 = new THREE.Matrix4();
   private readonly tmpVec3 = new THREE.Vector3();
@@ -622,6 +779,11 @@ export class SSFRRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    this.lightUniform = this.device.createBuffer({
+      size: 176,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
     this.bilateralParamsH = this.device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -635,6 +797,11 @@ export class SSFRRenderer {
       size: 128,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    this.compositeLightUniform = this.device.createBuffer({
+      size: 144,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
   private createPipelines(particlesBuffer: GPUBuffer): void {
     const depthMod = this.device.createShaderModule({
@@ -642,6 +809,9 @@ export class SSFRRenderer {
     });
     const thickMod = this.device.createShaderModule({
       code: particleThicknessWGSL,
+    });
+    const lightDepthMod = this.device.createShaderModule({
+      code: lightDepthWGSL,
     });
     const bilatMod = this.device.createShaderModule({ code: bilateralWGSL });
     const compMod = this.device.createShaderModule({ code: compositeWGSL });
@@ -673,6 +843,22 @@ export class SSFRRenderer {
       layout: particleLayout,
       entries: [
         { binding: 0, resource: { buffer: this.particleUniform } },
+        { binding: 1, resource: { buffer: particlesBuffer } },
+      ],
+    });
+
+    this.lightDepthBind = this.device.createBindGroup({
+      layout: particleLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.lightUniform } },
+        { binding: 1, resource: { buffer: particlesBuffer } },
+      ],
+    });
+
+    this.lightThicknessBind = this.device.createBindGroup({
+      layout: particleLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.lightUniform } },
         { binding: 1, resource: { buffer: particlesBuffer } },
       ],
     });
@@ -712,6 +898,24 @@ export class SSFRRenderer {
             },
           },
         ],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    this.lightDepthPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [particleLayout],
+      }),
+      vertex: { module: lightDepthMod, entryPoint: "vs" },
+      fragment: {
+        module: lightDepthMod,
+        entryPoint: "fs",
+        targets: [{ format: "r32float" }],
+      },
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
       },
       primitive: { topology: "triangle-list" },
     });
@@ -784,9 +988,29 @@ export class SSFRRenderer {
       ],
     });
 
+    const compositeLightLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
+      ],
+    });
+
     this.compositePipeline = this.device.createRenderPipeline({
       layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [compLayout],
+        bindGroupLayouts: [compLayout, compositeLightLayout],
       }),
       vertex: { module: compMod, entryPoint: "vs" },
       fragment: {
@@ -799,6 +1023,33 @@ export class SSFRRenderer {
 
     this.compLayout = compLayout;
     this.bilatLayout = bilatLayout;
+
+    this.lightDepthTexture = this.device.createTexture({
+      size: [LIGHT_MAP_SIZE, LIGHT_MAP_SIZE],
+      format: "r32float",
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.lightThicknessTexture = this.device.createTexture({
+      size: [LIGHT_MAP_SIZE, LIGHT_MAP_SIZE],
+      format: "r16float",
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.lightDepthStencil = this.device.createTexture({
+      size: [LIGHT_MAP_SIZE, LIGHT_MAP_SIZE],
+      format: "depth24plus",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    this.compositeLightBind = this.device.createBindGroup({
+      layout: compositeLightLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.compositeLightUniform } },
+        { binding: 1, resource: this.lightDepthTexture.createView() },
+        { binding: 2, resource: this.lightThicknessTexture.createView() },
+      ],
+    });
   }
   public resize(width: number, height: number): void {
     this.width = Math.max(1, width);
@@ -913,6 +1164,21 @@ export class SSFRRenderer {
   public getFluidWorldPosView(): GPUTextureView {
     return this.fluidWorldPosTexture.createView();
   }
+  public getLightDepthView(): GPUTextureView {
+    return this.lightDepthTexture.createView();
+  }
+  public getLightThicknessView(): GPUTextureView {
+    return this.lightThicknessTexture.createView();
+  }
+  public getLightDepthStencilView(): GPUTextureView {
+    return this.lightDepthStencil.createView();
+  }
+  public getLightViewProj(): Float32Array {
+    return this.lightViewProjArray;
+  }
+  public getLightView(): Float32Array {
+    return this.lightViewArray;
+  }
   public getFarDepth(): number {
     return FAR_DEPTH;
   }
@@ -924,6 +1190,77 @@ export class SSFRRenderer {
       if (this.width > 1 && this.height > 1)
         this.resize(this.width, this.height);
     }
+  }
+  private updateLightUniform(): void {
+    const dir = new THREE.Vector3(0.45, 1.0, 0.35).normalize();
+    const radius =
+      Math.sqrt(
+        config.boundsWidth * config.boundsWidth +
+          config.boundsHeight * config.boundsHeight +
+          config.boundsDepth * config.boundsDepth,
+      ) *
+        0.5 +
+      4;
+
+    const eye = dir.clone().multiplyScalar(radius * 3);
+    const camWorld = new THREE.Matrix4().lookAt(
+      eye,
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 1, 0),
+    );
+    camWorld.setPosition(eye);
+    const view = camWorld.clone().invert();
+
+    const proj = new THREE.Matrix4().makeOrthographic(
+      -radius,
+      radius,
+      radius,
+      -radius,
+      radius * 1.5,
+      radius * 5,
+    );
+    proj.premultiply(Z_REMAP);
+
+    const viewProj = new THREE.Matrix4().multiplyMatrices(proj, view);
+
+    const e = camWorld.elements;
+    const rightX = e[0];
+    const rightY = e[1];
+    const rightZ = e[2];
+    const upX = e[4];
+    const upY = e[5];
+    const upZ = e[6];
+
+    const splatWorldRadius = config.particleSize * config.renderSplatScale;
+
+    const u = new Float32Array(44);
+    u.set(view.elements, 0);
+    u.set(proj.elements, 16);
+    u[32] = rightX;
+    u[33] = rightY;
+    u[34] = rightZ;
+    u[35] = 0;
+    u[36] = upX;
+    u[37] = upY;
+    u[38] = upZ;
+    u[39] = 0;
+    u[40] = splatWorldRadius;
+    u[41] = 0;
+    u[42] = 0;
+    u[43] = 0;
+    this.device.queue.writeBuffer(this.lightUniform, 0, u);
+
+    this.lightViewProjArray.set(viewProj.elements);
+    this.lightViewArray.set(view.elements);
+
+    const shadowData = new Float32Array(36);
+    shadowData.set(viewProj.elements, 0);
+    shadowData.set(view.elements, 16);
+    shadowData[32] = this.lightAbsorb[0];
+    shadowData[33] = this.lightAbsorb[1];
+    shadowData[34] = this.lightAbsorb[2];
+    shadowData[35] = 0;
+    this.device.queue.writeBuffer(this.compositeLightUniform, 0, shadowData);
   }
   public updateFrame(
     viewMatrix: Float32Array,
@@ -953,6 +1290,8 @@ export class SSFRRenderer {
     pu[42] = 0;
     pu[43] = 0;
     this.device.queue.writeBuffer(this.particleUniform, 0, pu);
+
+    this.updateLightUniform();
 
     const sigmaWorld = splatWorldRadius * 0.9;
     const sigmaDepthWorld = splatWorldRadius * 2.5;
@@ -1051,6 +1390,22 @@ export class SSFRRenderer {
     pass.setBindGroup(0, this.thicknessBindGroup);
     pass.draw(6, particleCount, 0, 0);
   }
+  public encodeLightDepth(
+    pass: GPURenderPassEncoder,
+    particleCount: number,
+  ): void {
+    pass.setPipeline(this.lightDepthPipeline);
+    pass.setBindGroup(0, this.lightDepthBind);
+    pass.draw(6, particleCount, 0, 0);
+  }
+  public encodeLightThickness(
+    pass: GPURenderPassEncoder,
+    particleCount: number,
+  ): void {
+    pass.setPipeline(this.thicknessPipeline);
+    pass.setBindGroup(0, this.lightThicknessBind);
+    pass.draw(6, particleCount, 0, 0);
+  }
   public encodeBilateralH(pass: GPUComputePassEncoder): void {
     pass.setPipeline(this.bilateralHPipeline);
     pass.setBindGroup(0, this.bilateralHBind);
@@ -1070,6 +1425,7 @@ export class SSFRRenderer {
   public encodeComposite(pass: GPURenderPassEncoder): void {
     pass.setPipeline(this.compositePipeline);
     pass.setBindGroup(0, this.compositeBindGroup);
+    pass.setBindGroup(1, this.compositeLightBind);
     pass.draw(3);
   }
 }

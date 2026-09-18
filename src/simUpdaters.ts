@@ -11,9 +11,9 @@ type ActiveShape = Exclude<ObjectSlotConfig["type"], "none">;
 
 const OBJECT_COLORS: Record<ObjectSlotConfig["type"], RGBA> = {
   none: [1, 1, 1, 0],
-  sphere: [0.2, 0.7, 1.0, 0.9],
-  box: [1.0, 0.5, 0.2, 0.9],
-  torusKnot: [0.5, 1.0, 0.3, 0.9],
+  sphere: [0.2, 0.7, 1.0, 1.0],
+  box: [1.0, 0.5, 0.2, 1.0],
+  torusKnot: [0.5, 1.0, 0.3, 1.0],
 };
 
 const PROBE_OFFSETS: [number, number, number][] = (() => {

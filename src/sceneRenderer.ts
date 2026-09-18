@@ -19,8 +19,17 @@ struct ObjectUniforms {
   rotation: vec4<f32>,
 };
 
+struct LightUniforms {
+  viewProj: mat4x4<f32>,
+  view: mat4x4<f32>,
+  params: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(1) @binding(0) var<uniform> obj: ObjectUniforms;
+@group(2) @binding(0) var<uniform> light: LightUniforms;
+@group(2) @binding(1) var lightDepth: texture_2d<f32>;
+@group(2) @binding(2) var lightThickness: texture_2d<f32>;
 
 fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
   let qv = q.xyz;
@@ -32,6 +41,44 @@ fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
 fn acesFilmic(x: vec3<f32>) -> vec3<f32> {
   let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn computeShadow(worldPos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+  let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
+  let nDotL = max(dot(normal, lightDir), 0.0);
+
+  let normalOffset = 0.06 + 0.18 * (1.0 - nDotL);
+  let offsetPos = worldPos + normal * normalOffset;
+
+  let lp = light.viewProj * vec4<f32>(offsetPos, 1.0);
+  let w = max(abs(lp.w), 1e-6);
+  let ndc = lp.xyz / w;
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return vec3<f32>(1.0);
+  }
+
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let dims = vec2<f32>(textureDimensions(lightDepth));
+  let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+
+  let mapZ = textureLoad(lightDepth, px, 0).r;
+  let lv = light.view * vec4<f32>(offsetPos, 1.0);
+  let recZ = -lv.z;
+
+  let slopeBias = 0.08 + 0.85 * (1.0 - nDotL) * (1.0 - nDotL);
+  let diff = recZ - mapZ;
+  let shadowAmt = smoothstep(slopeBias, slopeBias + 0.40, diff);
+
+  let rawThickness = textureLoad(lightThickness, px, 0).r;
+  let thickness = min(rawThickness, 3.0);
+  let absorb = exp(-light.params.rgb * thickness);
+
+  let opaqueAmount = 1.0 - smoothstep(0.0, 0.5, thickness);
+  let occluderColor = mix(absorb, vec3<f32>(0.0), opaqueAmount);
+
+  let tinted = mix(vec3<f32>(1.0), occluderColor, shadowAmt);
+  let backfaceMask = smoothstep(0.0, 0.20, nDotL);
+  return mix(vec3<f32>(1.0), max(tinted, vec3<f32>(0.35)), backfaceMask);
 }
 
 struct MeshVIn {
@@ -62,17 +109,73 @@ fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
   let n = normalize(input.worldNormal);
   let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
   let ndl = max(dot(n, lightDir), 0.0);
-
-  var lit = obj.color.rgb * (0.28 + ndl * 0.95);
-
   let viewDir = normalize(frame.cameraPos.xyz - input.worldPos);
+
+  let shadow = computeShadow(input.worldPos, n);
+
+  let ambient = vec3<f32>(0.30, 0.36, 0.44);
+  let direct = obj.color.rgb * (ndl * 0.95) * shadow;
+
+  var lit = obj.color.rgb * ambient + direct;
+
   let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.55;
   lit += vec3<f32>(0.35, 0.65, 1.0) * rim;
 
   let halfDir = normalize(lightDir + viewDir);
-  lit += vec3<f32>(pow(max(dot(n, halfDir), 0.0), 48.0) * 0.4);
+  lit += vec3<f32>(pow(max(dot(n, halfDir), 0.0), 48.0) * 0.4) * shadow;
 
   return vec4<f32>(acesFilmic(lit * 1.3), obj.color.a);
+}
+`;
+
+const lightObjectWGSL = /* wgsl */ `
+struct LightUniforms {
+  viewProj: mat4x4<f32>,
+  view: mat4x4<f32>,
+  params: vec4<f32>,
+};
+
+struct ObjectUniforms {
+  scale: vec4<f32>,
+  translate: vec4<f32>,
+  color: vec4<f32>,
+  rotation: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> light: LightUniforms;
+@group(1) @binding(0) var<uniform> obj: ObjectUniforms;
+
+fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let qv = q.xyz;
+  let uv = cross(qv, v);
+  let uuv = cross(qv, uv);
+  return v + ((uv * q.w) + uuv) * 2.0;
+}
+
+struct VIn {
+  @location(0) position: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+};
+struct VOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+};
+
+@vertex
+fn light_vs(input: VIn) -> VOut {
+  let scaled = input.position * obj.scale.xyz;
+  let rotated = qRotateVec(obj.rotation, scaled);
+  let world = rotated + obj.translate.xyz;
+  var out: VOut;
+  out.clip = light.viewProj * vec4<f32>(world, 1.0);
+  out.worldPos = world;
+  return out;
+}
+
+@fragment
+fn light_fs(in: VOut) -> @location(0) vec4<f32> {
+  let lv = light.view * vec4<f32>(in.worldPos, 1.0);
+  return vec4<f32>(-lv.z, 0.0, 0.0, 0.0);
 }
 `;
 
@@ -125,8 +228,17 @@ struct TerrainUniforms {
   fogDensity: f32,
 };
 
+struct LightUniforms {
+  viewProj: mat4x4<f32>,
+  view: mat4x4<f32>,
+  params: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(1) @binding(0) var<uniform> terrain: TerrainUniforms;
+@group(2) @binding(0) var<uniform> light: LightUniforms;
+@group(2) @binding(1) var lightDepth: texture_2d<f32>;
+@group(2) @binding(2) var lightThickness: texture_2d<f32>;
 
 fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
   let qv = q.xyz;
@@ -138,6 +250,44 @@ fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
 fn acesFilmic(x: vec3<f32>) -> vec3<f32> {
   let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn computeShadow(worldPos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+  let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
+  let nDotL = max(dot(normal, lightDir), 0.0);
+
+  let normalOffset = 0.06 + 0.18 * (1.0 - nDotL);
+  let offsetPos = worldPos + normal * normalOffset;
+
+  let lp = light.viewProj * vec4<f32>(offsetPos, 1.0);
+  let w = max(abs(lp.w), 1e-6);
+  let ndc = lp.xyz / w;
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return vec3<f32>(1.0);
+  }
+
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let dims = vec2<f32>(textureDimensions(lightDepth));
+  let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+
+  let mapZ = textureLoad(lightDepth, px, 0).r;
+  let lv = light.view * vec4<f32>(offsetPos, 1.0);
+  let recZ = -lv.z;
+
+  let slopeBias = 0.08 + 0.85 * (1.0 - nDotL) * (1.0 - nDotL);
+  let diff = recZ - mapZ;
+  let shadowAmt = smoothstep(slopeBias, slopeBias + 0.40, diff);
+
+  let rawThickness = textureLoad(lightThickness, px, 0).r;
+  let thickness = min(rawThickness, 3.0);
+  let absorb = exp(-light.params.rgb * thickness);
+
+  let opaqueAmount = 1.0 - smoothstep(0.0, 0.5, thickness);
+  let occluderColor = mix(absorb, vec3<f32>(0.0), opaqueAmount);
+
+  let tinted = mix(vec3<f32>(1.0), occluderColor, shadowAmt);
+  let backfaceMask = smoothstep(0.0, 0.20, nDotL);
+  return mix(vec3<f32>(1.0), max(tinted, vec3<f32>(0.35)), backfaceMask);
 }
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -287,11 +437,16 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
 
   albedo = mix(albedo, sandMid, slope * 0.5);
 
-  let sunDir = normalize(vec3<f32>(0.35, 0.75, 0.30));
+  let sunDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
   let ndl = max(dot(n, sunDir), 0.0);
   let halfLambert = ndl * 0.7 + 0.30;
   let sunCol = vec3<f32>(1.02, 0.98, 0.92);
-  var lit = albedo * halfLambert * sunCol * 1.65;
+
+  let shadow = computeShadow(input.worldPos, n);
+
+  let ambientTerm = vec3<f32>(0.30, 0.34, 0.42);
+  let directTerm = vec3<f32>(halfLambert) * sunCol * 1.65;
+  var lit = albedo * (ambientTerm + directTerm * shadow);
 
   let depth = clamp(-input.localPos.y * 0.10, 0.0, 1.0);
   lit = mix(lit, lit * vec3<f32>(0.72, 0.66, 0.56), depth * 0.40);
@@ -313,19 +468,6 @@ export interface ObjectVisual {
   scale: number;
   color: [number, number, number, number];
 }
-
-const BLEND: GPUBlendState = {
-  color: {
-    srcFactor: "src-alpha",
-    dstFactor: "one-minus-src-alpha",
-    operation: "add",
-  },
-  alpha: {
-    srcFactor: "one",
-    dstFactor: "one-minus-src-alpha",
-    operation: "add",
-  },
-};
 
 const MESH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
   {
@@ -351,6 +493,7 @@ export class SceneRenderer {
   private meshPipeline!: GPURenderPipeline;
   private skyPipeline!: GPURenderPipeline;
   private terrainPipeline!: GPURenderPipeline;
+  private lightMeshPipeline!: GPURenderPipeline;
 
   private frameUniform!: GPUBuffer;
   private frameBindGroup!: GPUBindGroup;
@@ -363,6 +506,13 @@ export class SceneRenderer {
 
   private terrainUniform!: GPUBuffer;
   private terrainBindGroup!: GPUBindGroup;
+
+  private lightUniform!: GPUBuffer;
+  private lightBindGroup: GPUBindGroup | null = null;
+  private lightLayout!: GPUBindGroupLayout;
+
+  private lightObjectFrameLayout!: GPUBindGroupLayout;
+  private lightObjectFrameBind!: GPUBindGroup;
 
   private meshRegistry = new Map<string, RegisteredMesh>();
 
@@ -397,6 +547,35 @@ export class SceneRenderer {
   }
   public setTerrainMesh(id: string | null): void {
     this.terrainMeshId = id;
+  }
+  public setLightMaps(
+    depthView: GPUTextureView,
+    thicknessView: GPUTextureView,
+  ): void {
+    if (!this.lightUniform) return;
+    this.lightBindGroup = this.device.createBindGroup({
+      layout: this.lightLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.lightUniform } },
+        { binding: 1, resource: depthView },
+        { binding: 2, resource: thicknessView },
+      ],
+    });
+  }
+  public updateLight(
+    viewProj: Float32Array,
+    view: Float32Array,
+    absorb: [number, number, number],
+  ): void {
+    if (!this.lightUniform) return;
+    const data = new Float32Array(36);
+    data.set(viewProj, 0);
+    data.set(view, 16);
+    data[32] = absorb[0];
+    data[33] = absorb[1];
+    data[34] = absorb[2];
+    data[35] = 0;
+    this.device.queue.writeBuffer(this.lightUniform, 0, data);
   }
   public registerMesh(name: string, geometry: THREE.BufferGeometry): void {
     if (this.meshRegistry.has(name)) return;
@@ -449,6 +628,9 @@ export class SceneRenderer {
     const terrainMod = this.device.createShaderModule({
       code: terrainShaderWGSL,
     });
+    const lightMeshMod = this.device.createShaderModule({
+      code: lightObjectWGSL,
+    });
 
     const frameLayout = this.device.createBindGroupLayout({
       entries: [
@@ -474,8 +656,39 @@ export class SceneRenderer {
       ],
     });
 
+    const lightLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
+      ],
+    });
+    this.lightLayout = lightLayout;
+
+    this.lightObjectFrameLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
+
     const layout = this.device.createPipelineLayout({
-      bindGroupLayouts: [frameLayout, objectLayout],
+      bindGroupLayouts: [frameLayout, objectLayout, lightLayout],
     });
 
     this.frameUniform = this.device.createBuffer({
@@ -501,6 +714,16 @@ export class SceneRenderer {
           resource: { buffer: this.objectUniform, offset: 0, size: 64 },
         },
       ],
+    });
+
+    this.lightUniform = this.device.createBuffer({
+      size: 144,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    this.lightObjectFrameBind = this.device.createBindGroup({
+      layout: this.lightObjectFrameLayout,
+      entries: [{ binding: 0, resource: { buffer: this.lightUniform } }],
     });
 
     const skyLayout = this.device.createBindGroupLayout({
@@ -549,9 +772,7 @@ export class SceneRenderer {
       depthCompare: "less",
     };
 
-    const baseTargets: GPUColorTargetState[] = [
-      { format: this.format, blend: BLEND },
-    ];
+    const baseTargets: GPUColorTargetState[] = [{ format: this.format }];
 
     this.meshPipeline = this.device.createRenderPipeline({
       layout,
@@ -587,7 +808,7 @@ export class SceneRenderer {
 
     this.terrainPipeline = this.device.createRenderPipeline({
       layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [frameLayout, terrainLayout],
+        bindGroupLayouts: [frameLayout, terrainLayout, lightLayout],
       }),
       vertex: {
         module: terrainMod,
@@ -601,6 +822,28 @@ export class SceneRenderer {
       },
       depthStencil,
       multisample: { count: SAMPLE_COUNT },
+      primitive: { topology: "triangle-list", cullMode: "back" },
+    });
+
+    this.lightMeshPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.lightObjectFrameLayout, objectLayout],
+      }),
+      vertex: {
+        module: lightMeshMod,
+        entryPoint: "light_vs",
+        buffers: MESH_VERTEX_BUFFERS,
+      },
+      fragment: {
+        module: lightMeshMod,
+        entryPoint: "light_fs",
+        targets: [{ format: "r32float" }],
+      },
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      },
       primitive: { topology: "triangle-list", cullMode: "back" },
     });
   }
@@ -694,6 +937,37 @@ export class SceneRenderer {
       data,
     );
   }
+  public encodeLightObjects(pass: GPURenderPassEncoder): void {
+    for (let i = 0; i < this.objectVisuals.length; i++) {
+      const o = this.objectVisuals[i];
+      if (!o.visible) continue;
+      const slot = 3 + i;
+      this.writeObject(
+        slot,
+        [o.scale, o.scale, o.scale],
+        o.position,
+        o.color,
+        o.quaternion,
+      );
+    }
+
+    pass.setPipeline(this.lightMeshPipeline);
+    pass.setBindGroup(0, this.lightObjectFrameBind);
+
+    for (let i = 0; i < this.objectVisuals.length; i++) {
+      const o = this.objectVisuals[i];
+      if (!o.visible) continue;
+      const slot = 3 + i;
+      pass.setBindGroup(1, this.objectBindGroup, [slot * this.objectStride]);
+
+      const mesh = o.meshId ? this.meshRegistry.get(o.meshId) : null;
+      if (!mesh) continue;
+
+      pass.setVertexBuffer(0, mesh.vertex);
+      pass.setIndexBuffer(mesh.index, "uint32");
+      pass.drawIndexed(mesh.indexCount);
+    }
+  }
   public encode(pass: GPURenderPassEncoder): void {
     pass.setPipeline(this.skyPipeline);
     pass.setBindGroup(0, this.skyBindGroup);
@@ -732,6 +1006,7 @@ export class SceneRenderer {
 
         pass.setPipeline(this.terrainPipeline);
         pass.setBindGroup(1, this.terrainBindGroup);
+        if (this.lightBindGroup) pass.setBindGroup(2, this.lightBindGroup);
         pass.setVertexBuffer(0, mesh.vertex);
         pass.setIndexBuffer(mesh.index, "uint32");
         pass.drawIndexed(mesh.indexCount);
@@ -749,6 +1024,7 @@ export class SceneRenderer {
       if (!mesh) continue;
 
       pass.setPipeline(this.meshPipeline);
+      if (this.lightBindGroup) pass.setBindGroup(2, this.lightBindGroup);
       pass.setVertexBuffer(0, mesh.vertex);
       pass.setIndexBuffer(mesh.index, "uint32");
       pass.drawIndexed(mesh.indexCount);

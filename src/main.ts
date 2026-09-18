@@ -31,6 +31,11 @@ async function bootstrap(): Promise<void> {
     simulation.getParticlesBuffer(),
   );
 
+  sceneRenderer.setLightMaps(
+    ssfr.getLightDepthView(),
+    ssfr.getLightThicknessView(),
+  );
+
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
   meshRegistry.register(
     "torusKnot",
@@ -180,6 +185,12 @@ async function bootstrap(): Promise<void> {
       aspect,
     );
 
+    sceneRenderer.updateLight(
+      ssfr.getLightViewProj(),
+      ssfr.getLightView(),
+      ssfr.lightAbsorb,
+    );
+
     sceneRenderer.time = timer.getElapsed();
     sceneRenderer.waterLevel = -1.0;
     sceneRenderer.updateFrame(viewState.viewProj, [
@@ -187,6 +198,63 @@ async function bootstrap(): Promise<void> {
       camera.position.y,
       camera.position.z,
     ]);
+
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getLightDepthView(),
+            clearValue: { r: 1e6, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+        depthStencilAttachment: {
+          view: ssfr.getLightDepthStencilView(),
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+        },
+      });
+      ssfr.encodeLightDepth(pass, config.numParticles);
+      pass.end();
+    }
+
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getLightDepthView(),
+            clearValue: { r: 1e6, g: 0, b: 0, a: 0 },
+            loadOp: "load",
+            storeOp: "store",
+          },
+        ],
+        depthStencilAttachment: {
+          view: ssfr.getLightDepthStencilView(),
+          depthClearValue: 1.0,
+          depthLoadOp: "load",
+          depthStoreOp: "store",
+        },
+      });
+      sceneRenderer.encodeLightObjects(pass);
+      pass.end();
+    }
+
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ssfr.getLightThicknessView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      ssfr.encodeLightThickness(pass, config.numParticles);
+      pass.end();
+    }
 
     {
       const pass = encoder.beginRenderPass({
