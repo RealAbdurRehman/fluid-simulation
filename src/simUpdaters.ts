@@ -35,9 +35,12 @@ const MAX_ANGULAR_SPEED = 4.0;
 const AIR_LINEAR_DAMPING = 0.4;
 const AIR_ANGULAR_DAMPING = 1.2;
 
-const WATER_ANGULAR_DAMPING = 6.0;
-const BUOYANCY_TORQUE_CAP = 0.15;
-const RIGHTING_STRENGTH = 0.4;
+const WATER_ANGULAR_DAMPING = 20.0;
+const BUOYANCY_TORQUE_CAP = 0.4;
+const RIGHTING_STRENGTH = 0.12;
+const RIGHTING_DAMPING = 0.6;
+
+const PROBE_DENSITY_SCALE = 0.55;
 
 const TERRAIN_RESTITUTION = 0.08;
 const TERRAIN_FRICTION = 0.78;
@@ -59,6 +62,7 @@ const _tangent = new THREE.Vector3();
 const _tmpVecA = new THREE.Vector3();
 const _tmpVecB = new THREE.Vector3();
 const _tmpVecC = new THREE.Vector3();
+const _tmpVecD = new THREE.Vector3();
 
 const colorCache = new Map<string, RGBA>();
 
@@ -393,11 +397,13 @@ function createObjectsUpdater(
     const hasData =
       probeResults !== null && probeResults.length >= neededFloats;
 
+    const probeRho = localRho * PROBE_DENSITY_SCALE;
+
     if (hasData) {
       for (let p = 0; p < probeTotal; p++) {
         const o = (probeBase + p) * 4;
         const density = probeResults![o + 0];
-        const sub = THREE.MathUtils.clamp(density / localRho, 0, 1);
+        const sub = THREE.MathUtils.clamp(density / probeRho, 0, 1);
 
         _hullTmp.set(
           probePositions[o + 0],
@@ -444,7 +450,7 @@ function createObjectsUpdater(
       body.applyForceWorld(buoyancy, body.position, dt);
 
       const rSub = _hullTmp.subVectors(centerSub, body.position);
-      const torque = new THREE.Vector3().crossVectors(rSub, buoyancy);
+      const torque = _tmpVecD.crossVectors(rSub, buoyancy);
 
       const torqueCap = body.mass * g * slot.size * BUOYANCY_TORQUE_CAP;
       const torqueLen = torque.length();
@@ -474,8 +480,13 @@ function createObjectsUpdater(
       if (sinAngle > 1e-4) {
         axis.divideScalar(sinAngle);
         const angle = Math.asin(Math.min(sinAngle, 1.0));
-        const strength = submergedFraction * body.mass * g * RIGHTING_STRENGTH;
-        axis.multiplyScalar(angle * strength);
+        const kp =
+          submergedFraction * body.mass * g * RIGHTING_STRENGTH * slot.size;
+        const kd =
+          submergedFraction * body.mass * g * RIGHTING_DAMPING * slot.size;
+        const angVelAlong = body.angularVelocity.dot(axis);
+        const mag = angle * kp - angVelAlong * kd;
+        axis.multiplyScalar(mag);
         body.applyTorqueWorld(axis, dt);
       }
     }

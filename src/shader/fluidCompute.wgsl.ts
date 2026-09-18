@@ -433,18 +433,19 @@ fn resolveMesh(
   r.velocity = velIn;
 
   let q = queryMesh(collider, posIn);
-  if (!q.valid || q.dist >= radius) { return r; }
+  if (!q.valid) { return r; }
 
-  r.position = posIn + q.worldNormal * (radius - q.dist);
+  let skin = collider.sdfOrigin.w * max(collider.data2.x, 0.0001);
+  let dist = q.dist - skin;
+  if (dist >= radius) { return r; }
 
-  let restitution = collider.data2.w;
+  let push = min(radius - dist, radius);
+  r.position = posIn + q.worldNormal * push;
+
   let relVel = velIn - collider.velocity.xyz;
-  let velAlongNormal = dot(relVel, q.worldNormal);
+  let vn = dot(relVel, q.worldNormal);
   var newRelVel = relVel;
-  if (velAlongNormal < 0.0) {
-    newRelVel -= q.worldNormal * velAlongNormal * (1.0 + restitution);
-  }
-
+  if (vn < 0.0) { newRelVel -= q.worldNormal * vn * (1.0 + collider.data2.w); }
   r.velocity = newRelVel + collider.velocity.xyz;
   return r;
 }

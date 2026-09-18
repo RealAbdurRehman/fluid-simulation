@@ -341,6 +341,7 @@ function addObjectFolders(
   const modelOptions = ["none", ...MODEL_IDS];
   const maxSize =
     Math.min(config.boundsWidth, config.boundsHeight, config.boundsDepth) * 0.2;
+  const minSize = Math.max(config.particleSize * 2.0, 0.5);
 
   config.objects.forEach((slot, index) => {
     const folder = gui.addFolder(`Object ${index + 1}`);
@@ -348,7 +349,7 @@ function addObjectFolders(
       .add(slot, "modelId", modelOptions)
       .name("Model")
       .onChange(() => onObjectChanged(index));
-    folder.add(slot, "size", 0.1, maxSize, 0.05).name("Size");
+    folder.add(slot, "size", minSize, maxSize, 0.05).name("Size");
     folder
       .add(slot, "densityRatio", 0.05, 4.0, 0.05)
       .name("Density (rel. fluid)");

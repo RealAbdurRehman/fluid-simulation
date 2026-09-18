@@ -4,8 +4,8 @@ import type { SceneRenderer } from "./sceneRenderer";
 import { MODELS, type ModelDef } from "./models";
 import { loadModel, type LoadedModel } from "./modelLoader";
 
-export const MESH_BAKE_RESOLUTION = 64;
-export const MESH_BAKE_PADDING = 1.2;
+export const MESH_BAKE_RESOLUTION = 96;
+export const MESH_BAKE_PADDING = 0.5;
 
 export class MeshRegistry {
   private readonly simulation: FluidSimulationGPU;
