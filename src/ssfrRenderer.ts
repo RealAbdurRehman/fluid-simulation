@@ -4,7 +4,6 @@ import { config } from "./config";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const FAR_DEPTH = 1e6;
-const MAX_BILATERAL_RADIUS_PX = 10;
 const LIGHT_MAP_SIZE = 1024;
 
 const particleDepthWGSL = /* wgsl */ `
@@ -410,6 +409,11 @@ struct Uniforms {
   reflHorizon: vec4<f32>,
   params3: vec4<f32>,
   foamParams: vec4<f32>,
+  water0: vec4<f32>,
+  water1: vec4<f32>,
+  water2: vec4<f32>,
+  foamColor: vec4<f32>,
+  specColor: vec4<f32>,
   invView: mat4x4<f32>,
 };
 
@@ -610,10 +614,6 @@ fn traceSSR(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
 
 const MAX_OPTICAL_DEPTH: f32 = 3.0;
 
-const IOR_AIR: f32 = 1.0;
-const IOR_WATER: f32 = 1.33;
-const MAX_REFRACT_TRAVEL: f32 = 30.0;
-
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
   let sceneDimsI = vec2<i32>(textureDimensions(sceneDepth));
@@ -699,13 +699,11 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
   let foamRaw = sampleFoamDilated(fluidCoord, fluidDimsI);
 
-  let noiseScale = 2.5;
-  let n1 = fbm3(surfaceWS * noiseScale);
-  let n2 = fbm3(surfaceWS * noiseScale + vec3<f32>(17.3, 5.1, 11.7));
-  let noiseAmp = 0.6;
-  let perturb = vec2<f32>(n1 - 0.5, n2 - 0.5) * noiseAmp;
+  let n1 = fbm3(surfaceWS * u.water1.y);
+  let n2 = fbm3(surfaceWS * u.water1.y + vec3<f32>(17.3, 5.1, 11.7));
+  let perturb = vec2<f32>(n1 - 0.5, n2 - 0.5) * u.water1.z;
 
-  let flatness = smoothstep(0.3, 0.7, dot(normalSmooth, worldUpInView));
+  let flatness = smoothstep(u.water1.w, u.water2.x, dot(normalSmooth, worldUpInView));
 
   let perturbAmt = flatness * edgeFactor * facing;
   var normalShade = normalize(
@@ -727,26 +725,26 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let shadowTint = computeFluidShadow(surfaceWS, normalSmooth);
 
   let cosTheta = clamp(dot(normalShade, viewDir), 0.0, 1.0);
-  let F0 = 0.02;
+  let F0 = u.water1.x;
   let fresnel = min(F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0), 0.85);
 
   let baseScatter = u.params3.yzw;
-  let deepScatter = baseScatter * 0.22;
-  let depthMix = 1.0 - exp(-thickness * 0.22);
+  let deepScatter = baseScatter * u.water2.w;
+  let depthMix = 1.0 - exp(-thickness * u.water0.x);
   var scatterColor = mix(baseScatter, deepScatter, depthMix);
   scatterColor *= mix(vec3<f32>(0.5), vec3<f32>(1.0), shadowTint);
 
   let refrStr = u.params0.z;
-  let thicknessGate = smoothstep(2.0, 6.0, thickness);
+  let thicknessGate = smoothstep(u.water0.y, u.water0.z, thickness);
   let incident = -viewDir;
-  let refrDir = refract(incident, normalSmooth, IOR_AIR / IOR_WATER);
+  let refrDir = refract(incident, normalSmooth, u.water2.z);
 
   var refrUV = in.uv;
   if (dot(refrDir, refrDir) > 1e-6) {
     let travel = clamp(
       sqrt(max(thickness, 0.0)) * refrStr,
       0.0,
-      MAX_REFRACT_TRAVEL,
+      u.water2.y,
     ) * thicknessGate * edgeFactor * facing;
     let refrPoint = pC + refrDir * travel;
     let proj = projectToUV(refrPoint);
@@ -797,15 +795,14 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let halfVS = normalize(sunVS + viewDir);
   let spec = pow(max(dot(normalShade, halfVS), 0.0), u.params1.z);
   let specFacing = smoothstep(0.0, 0.4, facing);
-  col = col + vec3<f32>(1.0, 0.98, 0.92) * spec * 0.6 * edgeFactor * specFacing * shadowTint;
+  col = col + u.specColor.rgb * spec * u.params1.w * edgeFactor * specFacing * shadowTint;
 
-  let alpha = clamp((1.0 - exp(-thickness * 1.5)) * edgeFactor, 0.0, 1.0);
+  let alpha = clamp((1.0 - exp(-thickness * u.water0.w)) * edgeFactor, 0.0, 1.0);
   col = mix(sceneCol, col, alpha);
 
-  let foamColor = vec3<f32>(0.93, 0.96, 0.99);
   let foamVisible = foamMask * alpha * facing;
-  col = mix(col, foamColor, foamVisible);
-  col = col + vec3<f32>(1.0) * spec * foamVisible * 0.35 * shadowTint;
+  col = mix(col, u.foamColor.rgb, foamVisible);
+  col = col + u.specColor.rgb * spec * foamVisible * 0.35 * shadowTint;
 
   return vec4<f32>(col, 1.0);
 }
@@ -890,9 +887,12 @@ export class SSFRRenderer {
   private lightViewProjArray = new Float32Array(16);
   private lightViewArray = new Float32Array(16);
 
+  private readonly compositeData = new Float32Array(72);
+
   public time = 0;
-  public scatterColor: [number, number, number] = [0.07, 0.16, 0.2];
-  public lightAbsorb: [number, number, number] = [0.85, 0.45, 0.28];
+  public get lightAbsorb(): [number, number, number] {
+    return [config.lightAbsorb.r, config.lightAbsorb.g, config.lightAbsorb.b];
+  }
 
   private readonly tmpMat4 = new THREE.Matrix4();
   private readonly tmpVec3 = new THREE.Vector3();
@@ -942,7 +942,7 @@ export class SSFRRenderer {
     });
 
     this.compositeUniform = this.device.createBuffer({
-      size: 256,
+      size: 288,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -1451,9 +1451,9 @@ export class SSFRRenderer {
     const shadowData = new Float32Array(36);
     shadowData.set(viewProj.elements, 0);
     shadowData.set(view.elements, 16);
-    shadowData[32] = this.lightAbsorb[0];
-    shadowData[33] = this.lightAbsorb[1];
-    shadowData[34] = this.lightAbsorb[2];
+    shadowData[32] = config.lightAbsorb.r;
+    shadowData[33] = config.lightAbsorb.g;
+    shadowData[34] = config.lightAbsorb.b;
     shadowData[35] = 0;
     this.device.queue.writeBuffer(this.compositeLightUniform, 0, shadowData);
   }
@@ -1495,15 +1495,15 @@ export class SSFRRenderer {
 
     this.updateLightUniform();
 
-    const sigmaWorld = splatWorldRadius * 2.0;
-    const sigmaDepthWorld = splatWorldRadius * 10.0;
+    const sigmaWorld = splatWorldRadius * config.bilateralSigmaWorld;
+    const sigmaDepthWorld = splatWorldRadius * config.bilateralSigmaDepth;
 
     const writeParams = (buffer: GPUBuffer, axis: 0 | 1) => {
       const ab = new ArrayBuffer(32);
       const u = new Uint32Array(ab);
       const f = new Float32Array(ab);
       u[0] = axis;
-      u[1] = MAX_BILATERAL_RADIUS_PX;
+      u[1] = config.bilateralMaxRadiusPx;
       f[2] = sigmaWorld;
       f[3] = sigmaDepthWorld;
       f[4] = tanHalfFovY;
@@ -1520,54 +1520,79 @@ export class SSFRRenderer {
 
     const [sx, sy, sz] = this.sunDirView(viewMatrix);
 
-    const cu = new Float32Array(64);
+    const cu = this.compositeData;
 
     cu[0] = sx;
     cu[1] = sy;
     cu[2] = sz;
     cu[3] = 0;
 
-    cu[4] = 0.22;
-    cu[5] = 0.12;
-    cu[6] = 0.07;
+    cu[4] = config.waterAbsorb.r;
+    cu[5] = config.waterAbsorb.g;
+    cu[6] = config.waterAbsorb.b;
     cu[7] = 1.0;
 
     cu[8] = tanHalfFovY;
     cu[9] = aspect;
-    cu[10] = 1.4;
+    cu[10] = config.refractionStrength;
     cu[11] = near;
 
     cu[12] = far;
-    cu[13] = 0.1;
-    cu[14] = 200.0;
-    cu[15] = 0.02;
+    cu[13] = config.waterAbsorbStrength;
+    cu[14] = config.specularPower;
+    cu[15] = config.specularIntensity;
 
     cu[16] = this.time;
     cu[17] = this.tmpVec3.x;
     cu[18] = this.tmpVec3.y;
     cu[19] = this.tmpVec3.z;
 
-    cu[20] = 0.42;
-    cu[21] = 0.55;
-    cu[22] = 0.68;
+    cu[20] = config.reflSky.r;
+    cu[21] = config.reflSky.g;
+    cu[22] = config.reflSky.b;
     cu[23] = 1.0;
 
-    cu[24] = 0.14;
-    cu[25] = 0.24;
-    cu[26] = 0.34;
+    cu[24] = config.reflHorizon.r;
+    cu[25] = config.reflHorizon.g;
+    cu[26] = config.reflHorizon.b;
     cu[27] = 1.0;
 
     cu[28] = splatWorldRadius;
-    cu[29] = this.scatterColor[0];
-    cu[30] = this.scatterColor[1];
-    cu[31] = this.scatterColor[2];
+    cu[29] = config.waterColor.r;
+    cu[30] = config.waterColor.g;
+    cu[31] = config.waterColor.b;
 
     cu[32] = config.foamEnabled ? 1.0 : 0.0;
     cu[33] = config.foamNoiseScale;
     cu[34] = config.foamThreshold;
     cu[35] = config.foamSoftness;
 
-    cu.set(this.tmpMat4.elements, 36);
+    cu[36] = config.depthMixCoeff;
+    cu[37] = config.thicknessGateStart;
+    cu[38] = config.thicknessGateEnd;
+    cu[39] = config.alphaThicknessCoeff;
+
+    cu[40] = config.fresnelF0;
+    cu[41] = config.normalNoiseScale;
+    cu[42] = config.normalNoiseAmp;
+    cu[43] = config.flatnessStart;
+
+    cu[44] = config.flatnessEnd;
+    cu[45] = config.refractionTravelMax;
+    cu[46] = 1.0 / Math.max(config.iorWater, 1e-4);
+    cu[47] = config.waterDeepTint;
+
+    cu[48] = config.foamColor.r;
+    cu[49] = config.foamColor.g;
+    cu[50] = config.foamColor.b;
+    cu[51] = 1.0;
+
+    cu[52] = config.specColor.r;
+    cu[53] = config.specColor.g;
+    cu[54] = config.specColor.b;
+    cu[55] = 1.0;
+
+    cu.set(this.tmpMat4.elements, 56);
 
     this.device.queue.writeBuffer(this.compositeUniform, 0, cu);
   }
