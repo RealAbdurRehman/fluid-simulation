@@ -108,6 +108,15 @@ export const config = {
   smoothingRadius: 0.95,
   viscosityStrength: 0.4,
 
+  foamEnabled: true,
+  foamGenerationRate: 12.0,
+  foamDecayRate: 1.4,
+  foamMinSpeed: 1.5,
+  foamMaxSpeed: 9.0,
+  foamNoiseScale: 7.5,
+  foamThreshold: 0.25,
+  foamSoftness: 0.35,
+
   numParticles: 22768,
   maxParticles: 42768,
   particleSize: 0.4,
@@ -123,7 +132,7 @@ export const config = {
   boundsRotationZ: 0,
   boundsAutoTumble: false,
 
-  renderSplatScale: 1.25,
+  renderSplatScale: 1.35,
 
   objects: [
     makeObjectSlot({
@@ -176,6 +185,7 @@ export function setupGUI(
   addSimulationFolder(gui);
   addContainerFolder(gui, onUpdateBounds);
   addSPHFolder(gui);
+  addFoamFolder(gui);
   addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
   addTerrainFolder(gui, onRegenerateTerrain);
@@ -271,6 +281,18 @@ function addSPHFolder(gui: GUI): void {
     .add(config, "smoothingRadius", 0.3, 2.0, 0.02)
     .name("Smoothing Radius");
   folder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
+}
+
+function addFoamFolder(gui: GUI): void {
+  const folder = gui.addFolder("Foam");
+  folder.add(config, "foamEnabled").name("Enabled");
+  folder.add(config, "foamGenerationRate", 0, 20, 0.5).name("Generation");
+  folder.add(config, "foamDecayRate", 0.1, 5, 0.1).name("Decay Rate");
+  folder.add(config, "foamMinSpeed", 0, 10, 0.5).name("Min Speed Gate");
+  folder.add(config, "foamMaxSpeed", 1, 20, 0.5).name("Max Speed Gate");
+  folder.add(config, "foamNoiseScale", 1, 15, 0.5).name("Noise Scale");
+  folder.add(config, "foamThreshold", 0, 1, 0.02).name("Threshold");
+  folder.add(config, "foamSoftness", 0.02, 0.8, 0.02).name("Softness");
 }
 
 function addParticleFolder(

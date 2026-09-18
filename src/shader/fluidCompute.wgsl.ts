@@ -38,6 +38,7 @@ struct SimParams {
   terrainMeta: vec4<f32>,
   gridInfo: vec4<u32>,
   gridInfo2: vec4<f32>,
+  foamParams: vec4<f32>, // x: generationRate, y: decayRate, z: minSpeed, w: maxSpeed
 };
 
 struct ProbeSample {
@@ -199,6 +200,8 @@ fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x;
   if (index >= params.numParticles) { return; }
 
+  let prevFoam = particles[index].density.z;
+
   let pos = particles[index].predictedPosition.xyz;
   let centerCell = localToCell(worldToLocal(pos));
   let radius = params.smoothingRadius;
@@ -246,7 +249,7 @@ fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
 
-  particles[index].density = vec4<f32>(density, nearDensity, 0.0, 0.0);
+  particles[index].density = vec4<f32>(density, nearDensity, prevFoam, 0.0);
 }
 
 fn containerRepulsionForce(pos: vec3<f32>, radius: f32) -> vec3<f32> {
@@ -554,6 +557,7 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
 
   var pressureForce = vec3<f32>(0.0);
   var viscosityForce = vec3<f32>(0.0);
+  var trappedAir = 0.0;
 
   for (var oz = -search; oz <= search; oz++) {
     let zc = centerCell.z + oz;
@@ -606,6 +610,16 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
             let viscWeight = vVisc * vVisc * viscFactor;
             let viscDamping = min(viscWeight * viscScale, 0.40) * invDt;
             viscosityForce += (neighborVel - vel) * viscDamping;
+
+            // --- trapped-air potential (foam) ---
+            let velDiff = vel - neighborVel;
+            let velDiffLen = length(velDiff);
+            if (velDiffLen > 1e-4) {
+              let velDiffDir = velDiff / velDiffLen;
+              // xij_hat points from the neighbor toward this particle, which is -dir
+              let align = clamp(1.0 - dot(velDiffDir, -dir), 0.0, 2.0);
+              trappedAir += vVisc * vVisc * align * velDiffLen;
+            }
           }
         }
       }
@@ -624,6 +638,17 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
 
   let wallAccel = containerRepulsionForce(pos, params.particleRadius);
   particles[index].velocity = vec4<f32>(vel + (totalAcceleration + wallAccel) * params.deltaTime, 0.0);
+
+  // --- foam: gate trapped-air potential by speed and free-surface proximity, decay, store ---
+  let speed = length(vel);
+  let kinetic = smoothstep(params.foamParams.z, params.foamParams.w, speed);
+  let surfaceExposure = clamp(1.0 - density / max(targetDensity, 0.0001), 0.0, 1.0);
+  let foamGain = trappedAir * kinetic * surfaceExposure * params.foamParams.x * dt;
+
+  let d = particles[index].density;
+  let decayedFoam = d.z * exp(-params.foamParams.y * dt);
+  let newFoam = clamp(decayedFoam + foamGain, 0.0, 1.0);
+  particles[index].density = vec4<f32>(d.x, d.y, newFoam, d.w);
 }
 
 @compute @workgroup_size(256)

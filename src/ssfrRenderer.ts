@@ -4,7 +4,7 @@ import { config } from "./config";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const FAR_DEPTH = 1e6;
-const MAX_BILATERAL_RADIUS_PX = 4;
+const MAX_BILATERAL_RADIUS_PX = 10;
 const LIGHT_MAP_SIZE = 1024;
 
 const particleDepthWGSL = /* wgsl */ `
@@ -34,6 +34,7 @@ struct VOut {
   @location(0) uv: vec2<f32>,
   @location(1) viewZ: f32,
   @location(2) worldPos: vec3<f32>,
+  @location(3) foam: f32,
 };
 
 @vertex
@@ -60,6 +61,7 @@ fn vs(
   out.uv = quad[vi];
   out.viewZ = -viewPos.z;
   out.worldPos = worldPos;
+  out.foam = p.density.z;
   return out;
 }
 
@@ -79,7 +81,7 @@ fn fs(in: VOut) -> FOut {
   let surfaceViewZ = in.viewZ - sphereZ;
 
   out.viewZ = vec4<f32>(surfaceViewZ, 0.0, 0.0, 0.0);
-  out.world = vec4<f32>(in.worldPos, 1.0);
+  out.world = vec4<f32>(in.worldPos, in.foam);
 
   let viewSpaceZ = -surfaceViewZ;
   let clip = u.projectionMatrix * vec4<f32>(0.0, 0.0, viewSpaceZ, 1.0);
@@ -305,6 +307,8 @@ struct Uniforms {
   reflSky: vec4<f32>,
   reflHorizon: vec4<f32>,
   params3: vec4<f32>,
+  foamParams: vec4<f32>,
+  invView: mat4x4<f32>, 
 };
 
 struct LightShadowU {
@@ -352,6 +356,22 @@ fn reconstructViewPos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
   let x = (uv.x * 2.0 - 1.0) * aspect * th * depth;
   let y = (1.0 - uv.y * 2.0) * th * depth;
   return vec3<f32>(x, y, -depth);
+}
+
+fn viewToWorld(vp: vec3<f32>) -> vec3<f32> {
+  return (u.invView * vec4<f32>(vp, 1.0)).xyz;
+}
+
+fn sampleFoamDilated(coord: vec2<i32>, dims: vec2<i32>) -> f32 {
+  var best = 0.0;
+  for (var dy = -2; dy <= 2; dy = dy + 1) {
+    for (var dx = -2; dx <= 2; dx = dx + 1) {
+      let c = clamp(coord + vec2<i32>(dx, dy),
+                    vec2<i32>(0), dims - vec2<i32>(1));
+      best = max(best, textureLoad(fluidWorldPos, c, 0).w);
+    }
+  }
+  return best;
 }
 
 fn projectToUV(viewPos: vec3<f32>) -> vec3<f32> {
@@ -528,16 +548,19 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     }
   }
 
-  let fluidMax = fluidDimsI - vec2<i32>(1);
-  let dL = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(-1, 0), vec2<i32>(0), fluidMax), 0).r;
-  let dR = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>( 1, 0), vec2<i32>(0), fluidMax), 0).r;
-  let dU = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0, -1), vec2<i32>(0), fluidMax), 0).r;
-  let dD = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0,  1), vec2<i32>(0), fluidMax), 0).r;
+  let pC = reconstructViewPos(in.uv, dC);
+  let surfaceWS = viewToWorld(pC);
 
-  let validL = dL < 1e5;
-  let validR = dR < 1e5;
-  let validU = dU < 1e5;
-  let validD = dD < 1e5;
+  let fluidMax = fluidDimsI - vec2<i32>(1);
+  let sL = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(-2, 0), vec2<i32>(0), fluidMax), 0).r;
+  let sR = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>( 2, 0), vec2<i32>(0), fluidMax), 0).r;
+  let sU = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0, -2), vec2<i32>(0), fluidMax), 0).r;
+  let sD = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0,  2), vec2<i32>(0), fluidMax), 0).r;
+
+  let validL = sL < 1e5;
+  let validR = sR < 1e5;
+  let validU = sU < 1e5;
+  let validD = sD < 1e5;
 
   var validCount = 0.0;
   if (validL) { validCount = validCount + 1.0; }
@@ -546,24 +569,19 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   if (validD) { validCount = validCount + 1.0; }
   let edgeFactor = validCount / 4.0;
 
-  let dLv = select(dC, dL, validL);
-  let dRv = select(dC, dR, validR);
-  let dUv = select(dC, dU, validU);
-  let dDv = select(dC, dD, validD);
+  let dLv = select(dC, sL, validL);
+  let dRv = select(dC, sR, validR);
+  let dUv = select(dC, sU, validU);
+  let dDv = select(dC, sD, validD);
 
-  let texel = vec2<f32>(1.0) / fluidDimsF;
-  let pC = reconstructViewPos(in.uv, dC);
+  let texel = vec2<f32>(2.0) / fluidDimsF;
   let pL = reconstructViewPos(in.uv - vec2<f32>(texel.x, 0.0), dLv);
   let pR = reconstructViewPos(in.uv + vec2<f32>(texel.x, 0.0), dRv);
   let pU = reconstructViewPos(in.uv - vec2<f32>(0.0, texel.y), dUv);
   let pD = reconstructViewPos(in.uv + vec2<f32>(0.0, texel.y), dDv);
 
-  let dxFwd = pR - pC;
-  let dxBwd = pC - pL;
-  let ddx = select(dxFwd, dxBwd, abs(dxFwd.z) > abs(dxBwd.z));
-  let dyFwd = pD - pC;
-  let dyBwd = pC - pU;
-  let ddy = select(dyFwd, dyBwd, abs(dyFwd.z) > abs(dyBwd.z));
+  let ddx = pR - pL;
+  let ddy = pD - pU;
 
   let worldUpInView = normalize(u.params2.yzw);
   var normalSmooth: vec3<f32>;
@@ -576,22 +594,35 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
   let facing = clamp(abs(normalSmooth.z), 0.0, 1.0);
 
-  let surfaceWorld = textureLoad(fluidWorldPos, fluidCoord, 0).xyz;
+ 
+  let foamRaw = sampleFoamDilated(fluidCoord, fluidDimsI);
+
   let noiseScale = 2.5;
-  let n1 = fbm3(surfaceWorld * noiseScale);
-  let n2 = fbm3(surfaceWorld * noiseScale + vec3<f32>(17.3, 5.1, 11.7));
+  let n1 = fbm3(surfaceWS * noiseScale);
+  let n2 = fbm3(surfaceWS * noiseScale + vec3<f32>(17.3, 5.1, 11.7));
   let noiseAmp = 0.6;
   let perturb = vec2<f32>(n1 - 0.5, n2 - 0.5) * noiseAmp;
 
   let flatness = smoothstep(0.3, 0.7, dot(normalSmooth, worldUpInView));
+ 
+  let perturbAmt = flatness * edgeFactor * facing;
   var normalShade = normalize(
-    normalSmooth + vec3<f32>(perturb * flatness * edgeFactor * facing, 0.0),
+    normalSmooth + vec3<f32>(perturb.x, perturb.y, 0.0) * perturbAmt,
   );
+
+  let foamDetail = fbm3(surfaceWS * u.foamParams.y);
+  let foamEdge = fbm3(surfaceWS * u.foamParams.y * 3.3 + vec3<f32>(9.1, 2.4, 5.6));
+  let foamShaped = foamRaw * mix(0.5, 1.4, foamDetail) - foamEdge * 0.12;
+  let foamMask = smoothstep(
+    u.foamParams.z,
+    u.foamParams.z + u.foamParams.w,
+    foamShaped
+  ) * u.foamParams.x;
 
   let thickness = textureLoad(fluidThickness, fluidCoord, 0).r;
   let viewDir = normalize(-reconstructViewPos(in.uv, dC));
 
-  let shadowTint = computeFluidShadow(surfaceWorld, normalSmooth);
+  let shadowTint = computeFluidShadow(surfaceWS, normalSmooth);
 
   let cosTheta = clamp(dot(normalShade, viewDir), 0.0, 1.0);
   let F0 = 0.02;
@@ -668,6 +699,11 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
   let alpha = clamp((1.0 - exp(-thickness * 1.5)) * edgeFactor, 0.0, 1.0);
   col = mix(sceneCol, col, alpha);
+
+  let foamColor = vec3<f32>(0.93, 0.96, 0.99);
+  let foamVisible = foamMask * alpha * facing;
+  col = mix(col, foamColor, foamVisible);
+  col = col + vec3<f32>(1.0) * spec * foamVisible * 0.35 * shadowTint;
 
   return vec4<f32>(col, 1.0);
 }
@@ -794,7 +830,7 @@ export class SSFRRenderer {
     });
 
     this.compositeUniform = this.device.createBuffer({
-      size: 128,
+      size: 256,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -1293,8 +1329,8 @@ export class SSFRRenderer {
 
     this.updateLightUniform();
 
-    const sigmaWorld = splatWorldRadius * 0.9;
-    const sigmaDepthWorld = splatWorldRadius * 2.5;
+    const sigmaWorld = splatWorldRadius * 2.0;
+    const sigmaDepthWorld = splatWorldRadius * 10.0;
 
     const writeParams = (buffer: GPUBuffer, axis: 0 | 1) => {
       const ab = new ArrayBuffer(32);
@@ -1317,7 +1353,8 @@ export class SSFRRenderer {
     this.tmpVec3.set(0, 1, 0).transformDirection(this.tmpMat4);
 
     const [sx, sy, sz] = this.sunDirView(viewMatrix);
-    const cu = new Float32Array(32);
+
+    const cu = new Float32Array(64);
 
     cu[0] = sx;
     cu[1] = sy;
@@ -1358,6 +1395,13 @@ export class SSFRRenderer {
     cu[29] = this.scatterColor[0];
     cu[30] = this.scatterColor[1];
     cu[31] = this.scatterColor[2];
+
+    cu[32] = config.foamEnabled ? 1.0 : 0.0;
+    cu[33] = config.foamNoiseScale;
+    cu[34] = config.foamThreshold;
+    cu[35] = config.foamSoftness;
+
+    cu.set(this.tmpMat4.elements, 36);
 
     this.device.queue.writeBuffer(this.compositeUniform, 0, cu);
   }
