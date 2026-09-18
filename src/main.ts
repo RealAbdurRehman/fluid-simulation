@@ -218,6 +218,12 @@ async function bootstrap(): Promise<void> {
             loadOp: "clear",
             storeOp: "store",
           },
+          {
+            view: ssfr.getFluidWorldPosView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
         ],
         depthStencilAttachment: {
           view: ssfr.getFluidDepthStencilView(),

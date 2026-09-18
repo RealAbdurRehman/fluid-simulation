@@ -32,6 +32,7 @@ struct VOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) uv: vec2<f32>,
   @location(1) viewZ: f32,
+  @location(2) worldPos: vec3<f32>,
 };
 
 @vertex
@@ -57,11 +58,13 @@ fn vs(
   out.clip = u.projectionMatrix * vec4<f32>(viewPos, 1.0);
   out.uv = quad[vi];
   out.viewZ = -viewPos.z;
+  out.worldPos = worldPos;
   return out;
 }
 
 struct FOut {
-  @location(0) color: vec4<f32>,
+  @location(0) viewZ: vec4<f32>,
+  @location(1) world: vec4<f32>,
   @builtin(frag_depth) depth: f32,
 };
 
@@ -74,7 +77,8 @@ fn fs(in: VOut) -> FOut {
   let sphereZ = u.particleScale * sqrt(max(1.0 - d2, 0.0));
   let surfaceViewZ = in.viewZ - sphereZ;
 
-  out.color = vec4<f32>(surfaceViewZ, 0.0, 0.0, 0.0);
+  out.viewZ = vec4<f32>(surfaceViewZ, 0.0, 0.0, 0.0);
+  out.world = vec4<f32>(in.worldPos, 1.0);
 
   let viewSpaceZ = -surfaceViewZ;
   let clip = u.projectionMatrix * vec4<f32>(0.0, 0.0, viewSpaceZ, 1.0);
@@ -234,6 +238,7 @@ struct Uniforms {
 @group(0) @binding(3) var fluidDepth: texture_2d<f32>;
 @group(0) @binding(4) var fluidThickness: texture_2d<f32>;
 @group(0) @binding(5) var linSamp: sampler;
+@group(0) @binding(6) var fluidWorldPos: texture_2d<f32>;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -275,17 +280,44 @@ fn projectToUV(viewPos: vec3<f32>) -> vec3<f32> {
   return vec3<f32>(ndcX * 0.5 + 0.5, 1.0 - (ndcY * 0.5 + 0.5), depth);
 }
 
-fn waveGradient(p: vec2<f32>, t: f32) -> vec2<f32> {
-  var d = vec2<f32>(0.0);
-  let a1 = 1.3; let b1 = 0.7;
-  d += vec2<f32>(a1, b1) * cos(p.x * a1 + p.y * b1 + t * 0.9);
-  let a2 = -0.9; let b2 = 1.4;
-  d += vec2<f32>(a2, b2) * cos(p.x * a2 + p.y * b2 - t * 0.7) * 0.7;
-  let a3 = 2.6; let b3 = -1.8;
-  d += vec2<f32>(a3, b3) * cos(p.x * a3 + p.y * b3 + t * 1.6) * 0.35;
-  let a4 = 3.3; let b4 = 2.9;
-  d += vec2<f32>(a4, b4) * cos(p.x * a4 + p.y * b4 - t * 1.1) * 0.2;
-  return d * 0.25;
+fn hash31(p: vec3<f32>) -> f32 {
+  var q = fract(p * vec3<f32>(127.1, 311.7, 74.7));
+  q += dot(q, q.yzx + 34.23);
+  return fract(q.x * q.y * q.z);
+}
+
+fn valueNoise3(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  let c000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+  let c100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+  let c010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+  let c110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+  let c001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+  let c101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+  let c011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+  let c111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+
+  let c00 = mix(c000, c100, u.x);
+  let c10 = mix(c010, c110, u.x);
+  let c01 = mix(c001, c101, u.x);
+  let c11 = mix(c011, c111, u.x);
+
+  return mix(mix(c00, c10, u.y), mix(c01, c11, u.y), u.z);
+}
+
+fn fbm3(p: vec3<f32>) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var q = p;
+  for (var i = 0; i < 3; i = i + 1) {
+    v += a * valueNoise3(q);
+    q = q * 2.07 + vec3<f32>(1.7, 9.2, 3.3);
+    a *= 0.5;
+  }
+  return v;
 }
 
 fn sampleFakeEnv(ry: f32) -> vec3<f32> {
@@ -423,11 +455,16 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
   let facing = clamp(abs(normalSmooth.z), 0.0, 1.0);
 
-  let pView = reconstructViewPos(in.uv, dC);
+  let surfaceWorld = textureLoad(fluidWorldPos, fluidCoord, 0).xyz;
+  let noiseScale = 2.5;
+  let n1 = fbm3(surfaceWorld * noiseScale);
+  let n2 = fbm3(surfaceWorld * noiseScale + vec3<f32>(17.3, 5.1, 11.7));
+  let noiseAmp = 0.6;
+  let perturb = vec2<f32>(n1 - 0.5, n2 - 0.5) * noiseAmp;
+
   let flatness = smoothstep(0.3, 0.7, dot(normalSmooth, worldUpInView));
-  let wave = waveGradient(pView.xy, u.params2.x);
   var normalShade = normalize(
-    normalSmooth + vec3<f32>(wave * 0.05 * flatness * edgeFactor * facing, 0.0),
+    normalSmooth + vec3<f32>(perturb * flatness * edgeFactor * facing, 0.0),
   );
 
   let thickness = textureLoad(fluidThickness, fluidCoord, 0).r;
@@ -540,6 +577,7 @@ export class SSFRRenderer {
   private fluidDepthTemp!: GPUTexture;
   private fluidDepthSmooth!: GPUTexture;
   private fluidThicknessTexture!: GPUTexture;
+  private fluidWorldPosTexture!: GPUTexture;
 
   private linearSampler!: GPUSampler;
 
@@ -647,7 +685,7 @@ export class SSFRRenderer {
       fragment: {
         module: depthMod,
         entryPoint: "fs",
-        targets: [{ format: "r32float" }],
+        targets: [{ format: "r32float" }, { format: "rgba16float" }],
       },
       depthStencil: {
         format: "depth24plus",
@@ -738,6 +776,11 @@ export class SSFRRenderer {
           visibility: GPUShaderStage.FRAGMENT,
           sampler: { type: "filtering" },
         },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
       ],
     });
 
@@ -770,6 +813,7 @@ export class SSFRRenderer {
     this.fluidDepthTemp?.destroy();
     this.fluidDepthSmooth?.destroy();
     this.fluidThicknessTexture?.destroy();
+    this.fluidWorldPosTexture?.destroy();
 
     const sceneSize = [this.width, this.height];
     const fluidSize = [this.fluidWidth, this.fluidHeight];
@@ -813,6 +857,12 @@ export class SSFRRenderer {
       usage:
         GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.fluidWorldPosTexture = this.device.createTexture({
+      size: fluidSize,
+      format: "rgba16float",
+      usage:
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
 
     this.bilateralHBind = this.device.createBindGroup({
       layout: this.bilatLayout,
@@ -841,6 +891,7 @@ export class SSFRRenderer {
         { binding: 3, resource: this.fluidDepthSmooth.createView() },
         { binding: 4, resource: this.fluidThicknessTexture.createView() },
         { binding: 5, resource: this.linearSampler },
+        { binding: 6, resource: this.fluidWorldPosTexture.createView() },
       ],
     });
   }
@@ -858,6 +909,9 @@ export class SSFRRenderer {
   }
   public getFluidThicknessView(): GPUTextureView {
     return this.fluidThicknessTexture.createView();
+  }
+  public getFluidWorldPosView(): GPUTextureView {
+    return this.fluidWorldPosTexture.createView();
   }
   public getFarDepth(): number {
     return FAR_DEPTH;
@@ -900,8 +954,8 @@ export class SSFRRenderer {
     pu[43] = 0;
     this.device.queue.writeBuffer(this.particleUniform, 0, pu);
 
-    const sigmaWorld = splatWorldRadius * 1.1;
-    const sigmaDepthWorld = splatWorldRadius * 2.0;
+    const sigmaWorld = splatWorldRadius * 0.9;
+    const sigmaDepthWorld = splatWorldRadius * 2.5;
 
     const writeParams = (buffer: GPUBuffer, axis: 0 | 1) => {
       const ab = new ArrayBuffer(32);
