@@ -67,13 +67,18 @@ async function bootstrap(): Promise<void> {
   }
 
   setupGUI(
-    () => simulation.updateParticleCount(),
+    () => {
+      simulation.updateParticleCount();
+      ssfr.setParticleCount(config.numParticles);
+    },
     regenerateTerrain,
     () => {},
     (index) => updaters.requestBakeForSlot(index),
     (index) => updaters.spawnObject(index),
     regenerateTerrain,
   );
+
+  ssfr.setParticleCount(config.numParticles);
 
   regenerateTerrain();
 
@@ -118,6 +123,7 @@ async function bootstrap(): Promise<void> {
 
   const timer = new THREE.Timer();
   const FIXED_DELTA = 1 / 60;
+  const MAX_STEPS_PER_FRAME = 2;
   let accumulator = 0;
 
   function animate(timestamp: number): void {
@@ -141,12 +147,15 @@ async function bootstrap(): Promise<void> {
       updaters.updateObjects(FIXED_DELTA);
       simulation.recordStepCommands(encoder, FIXED_DELTA);
     } else if (!config.paused) {
-      while (accumulator >= FIXED_DELTA) {
+      let steps = 0;
+      while (accumulator >= FIXED_DELTA && steps < MAX_STEPS_PER_FRAME) {
         accumulator -= FIXED_DELTA;
         updaters.updateBoundsRotation(FIXED_DELTA);
         updaters.updateObjects(FIXED_DELTA);
         simulation.recordStepCommands(encoder, FIXED_DELTA);
+        steps++;
       }
+      if (steps === MAX_STEPS_PER_FRAME) accumulator = 0;
     } else {
       accumulator = 0;
     }

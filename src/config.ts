@@ -123,7 +123,7 @@ export const config = {
   boundsRotationZ: 0,
   boundsAutoTumble: false,
 
-  renderSplatScale: 1.35,
+  renderSplatScale: 1.25,
 
   objects: [
     makeObjectSlot({

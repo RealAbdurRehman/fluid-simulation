@@ -6,11 +6,6 @@ import { GPUShaderStage, GPUBufferUsage, GPUMapMode } from "./types";
 import { bakeSignedDistanceFieldAsync } from "./sdfBaker";
 import type { TerrainData } from "./terrain";
 
-interface BitonicStep {
-  k: number;
-  j: number;
-}
-
 export interface BakedMeshHandle {
   dataOffset: number;
   dims: THREE.Vector3;
@@ -39,12 +34,14 @@ const TERRAIN_MAX_RESOLUTION = 512;
 const MAX_PROBES = 128;
 const PROBE_BYTES = 16;
 
+const MAX_GRID_DIM = 32;
+const MAX_GRID_CELLS = MAX_GRID_DIM * MAX_GRID_DIM * MAX_GRID_DIM;
+
 const COMPUTE_ENTRY_POINTS = [
   "externalForces",
-  "updateSpatialHash",
-  "bitonicSort",
-  "clearStartIndices",
-  "calculateStartIndices",
+  "countParticles",
+  "prefixSumGrid",
+  "scatterParticles",
   "calculateDensities",
   "calculateForces",
   "integratePositions",
@@ -59,16 +56,19 @@ export class FluidSimulationGPU {
 
   private maxPaddedCount = 0;
   private paddedParticlesCount = 0;
-  private bitonicSteps: BitonicStep[] = [];
-  private uniformAlignment = 256;
 
   private particlesBuffer!: GPUBuffer;
-  private spatialLookupBuffer!: GPUBuffer;
-  private startIndicesBuffer!: GPUBuffer;
   private simParamsBuffer!: GPUBuffer;
-  private bitonicParamsBuffer!: GPUBuffer;
   private collidersBuffer!: GPUBuffer;
   private collidersData = new Float32Array(MAX_COLLIDERS * FLOATS_PER_COLLIDER);
+
+  private gridBuffer!: GPUBuffer;
+  private sortedIndicesBuffer!: GPUBuffer;
+  private gridNumCells = 0;
+  private gridCellSize = 0;
+  private gridSearchRadius = 1;
+  private gridInfoU32 = new Uint32Array(4);
+  private gridInfoF32 = new Float32Array(4);
 
   private objects: ObjectDescriptor[] = [];
   private numColliders = 1;
@@ -97,8 +97,6 @@ export class FluidSimulationGPU {
     {} as never;
 
   private mainBindGroup!: GPUBindGroup;
-  private bitonicBindGroup!: GPUBindGroup;
-  private bitonicBindGroupLayout!: GPUBindGroupLayout;
 
   private rayOrigin = new THREE.Vector3();
   private rayDir = new THREE.Vector3();
@@ -118,10 +116,6 @@ export class FluidSimulationGPU {
     }
 
     this.device = await adapter.requestDevice();
-    this.uniformAlignment = Math.max(
-      256,
-      this.device.limits.minUniformBufferOffsetAlignment || 256,
-    );
 
     this.createPipelines();
     this.allocateFixedBuffers();
@@ -152,12 +146,12 @@ export class FluidSimulationGPU {
         {
           binding: 2,
           visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+          buffer: { type: "read-only-storage" },
         },
         {
           binding: 3,
           visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+          buffer: { type: "read-only-storage" },
         },
         {
           binding: 4,
@@ -167,7 +161,7 @@ export class FluidSimulationGPU {
         {
           binding: 5,
           visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
+          buffer: { type: "storage" },
         },
         {
           binding: 6,
@@ -182,21 +176,7 @@ export class FluidSimulationGPU {
         {
           binding: 8,
           visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
-        },
-      ],
-    });
-
-    this.bitonicBindGroupLayout = this.device.createBindGroupLayout({
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: {
-            type: "uniform",
-            hasDynamicOffset: true,
-            minBindingSize: 16,
-          },
+          buffer: { type: "storage" },
         },
       ],
     });
@@ -205,15 +185,9 @@ export class FluidSimulationGPU {
       bindGroupLayouts: [mainLayout],
     });
 
-    const bitonicPipelineLayout = this.device.createPipelineLayout({
-      bindGroupLayouts: [mainLayout, this.bitonicBindGroupLayout],
-    });
-
     for (const entry of COMPUTE_ENTRY_POINTS) {
-      const layout =
-        entry === "bitonicSort" ? bitonicPipelineLayout : mainPipelineLayout;
       this.pipelines[entry] = this.device.createComputePipeline({
-        layout,
+        layout: mainPipelineLayout,
         compute: { module: shaderModule, entryPoint: entry },
       });
     }
@@ -226,29 +200,11 @@ export class FluidSimulationGPU {
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       "particles",
     );
-    this.spatialLookupBuffer = this.createBuffer(
-      this.maxPaddedCount * 8,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      "spatialLookup",
-    );
-    this.startIndicesBuffer = this.createBuffer(
-      this.maxPaddedCount * 4,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      "startIndices",
-    );
+
     this.simParamsBuffer = this.createBuffer(
-      192,
+      176,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       "simParams",
-    );
-
-    const maxBitonicPasses =
-      (Math.log2(this.maxPaddedCount) * (Math.log2(this.maxPaddedCount) + 1)) /
-      2;
-    this.bitonicParamsBuffer = this.createBuffer(
-      Math.max(256, maxBitonicPasses * this.uniformAlignment),
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      "bitonicParams",
     );
 
     this.collidersBuffer = this.createBuffer(
@@ -267,6 +223,18 @@ export class FluidSimulationGPU {
       TERRAIN_MAX_RESOLUTION * TERRAIN_MAX_RESOLUTION * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       "terrain",
+    );
+
+    this.gridBuffer = this.createBuffer(
+      (2 * MAX_GRID_CELLS + 1) * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "grid",
+    );
+
+    this.sortedIndicesBuffer = this.createBuffer(
+      this.maxPaddedCount * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      "sortedIndices",
     );
 
     this.probeInputBuffer = this.createBuffer(
@@ -290,23 +258,13 @@ export class FluidSimulationGPU {
       entries: [
         { binding: 0, resource: { buffer: this.simParamsBuffer } },
         { binding: 1, resource: { buffer: this.particlesBuffer } },
-        { binding: 2, resource: { buffer: this.spatialLookupBuffer } },
-        { binding: 3, resource: { buffer: this.startIndicesBuffer } },
-        { binding: 4, resource: { buffer: this.collidersBuffer } },
-        { binding: 5, resource: { buffer: this.sdfDataBuffer } },
-        { binding: 6, resource: { buffer: this.probeInputBuffer } },
-        { binding: 7, resource: { buffer: this.probeOutputBuffer } },
-        { binding: 8, resource: { buffer: this.terrainBuffer } },
-      ],
-    });
-
-    this.bitonicBindGroup = this.device.createBindGroup({
-      layout: this.bitonicBindGroupLayout,
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: this.bitonicParamsBuffer, offset: 0, size: 16 },
-        },
+        { binding: 2, resource: { buffer: this.collidersBuffer } },
+        { binding: 3, resource: { buffer: this.sdfDataBuffer } },
+        { binding: 4, resource: { buffer: this.probeInputBuffer } },
+        { binding: 5, resource: { buffer: this.probeOutputBuffer } },
+        { binding: 6, resource: { buffer: this.terrainBuffer } },
+        { binding: 7, resource: { buffer: this.gridBuffer } },
+        { binding: 8, resource: { buffer: this.sortedIndicesBuffer } },
       ],
     });
   }
@@ -323,29 +281,6 @@ export class FluidSimulationGPU {
   }
   public updateParticleCount(): void {
     this.paddedParticlesCount = this.nextPowerOfTwo(config.numParticles);
-
-    this.bitonicSteps = [];
-    for (let k = 2; k <= this.paddedParticlesCount; k <<= 1)
-      for (let j = k >> 1; j > 0; j >>= 1) this.bitonicSteps.push({ k, j });
-
-    const bitonicDataArray = new Uint32Array(
-      (this.bitonicSteps.length * this.uniformAlignment) / 4,
-    );
-
-    for (let s = 0; s < this.bitonicSteps.length; s++) {
-      const u32Offset = (s * this.uniformAlignment) / 4;
-      bitonicDataArray[u32Offset + 0] = this.bitonicSteps[s].k;
-      bitonicDataArray[u32Offset + 1] = this.bitonicSteps[s].j;
-      bitonicDataArray[u32Offset + 2] = this.paddedParticlesCount;
-      bitonicDataArray[u32Offset + 3] = 0;
-    }
-
-    this.device.queue.writeBuffer(
-      this.bitonicParamsBuffer,
-      0,
-      bitonicDataArray,
-    );
-
     this.initParticleGrid();
   }
   public initParticleGrid(): void {
@@ -670,14 +605,43 @@ export class FluidSimulationGPU {
     this.terrainMeta[3] = 1;
     this.terrainExtentZ = t.extentZ;
   }
+  private updateGridConfig(): void {
+    const S = Math.max(
+      config.boundsWidth,
+      config.boundsHeight,
+      config.boundsDepth,
+    );
+    const maxCell = S / (MAX_GRID_DIM - 1);
+    const cellSize = Math.max(config.smoothingRadius, maxCell);
+    const gs = Math.min(MAX_GRID_DIM, Math.max(4, Math.floor(S / cellSize)));
+
+    this.gridCellSize = S / gs;
+    this.gridNumCells = gs * gs * gs;
+    this.gridSearchRadius = Math.max(
+      1,
+      Math.ceil(config.smoothingRadius / this.gridCellSize),
+    );
+
+    this.gridInfoU32[0] = this.gridNumCells;
+    this.gridInfoU32[1] = gs;
+    this.gridInfoU32[2] = this.gridSearchRadius;
+    this.gridInfoU32[3] = 0;
+
+    this.gridInfoF32[0] = this.gridCellSize;
+    this.gridInfoF32[1] = 0;
+    this.gridInfoF32[2] = 0;
+    this.gridInfoF32[3] = 0;
+  }
+
   public updateUniforms(subDelta: number): void {
     this.writeColliders();
+    this.updateGridConfig();
 
     const r = config.smoothingRadius;
     const r6 = Math.pow(r, 6);
     const r9 = Math.pow(r, 9);
 
-    const buffer = new ArrayBuffer(160);
+    const buffer = new ArrayBuffer(176);
     const f32 = new Float32Array(buffer);
     const u32 = new Uint32Array(buffer);
 
@@ -698,7 +662,7 @@ export class FluidSimulationGPU {
 
     f32[12] = subDelta;
     u32[13] = config.numParticles;
-    u32[14] = this.paddedParticlesCount;
+    u32[14] = this.gridNumCells;
     f32[15] = config.interactionRadius;
 
     f32[16] = this.interactionStrength;
@@ -726,6 +690,16 @@ export class FluidSimulationGPU {
     f32[34] = this.terrainMeta[2];
     f32[35] = this.terrainMeta[3];
 
+    u32[36] = this.gridInfoU32[0];
+    u32[37] = this.gridInfoU32[1];
+    u32[38] = this.gridInfoU32[2];
+    u32[39] = this.gridInfoU32[3];
+
+    f32[40] = this.gridInfoF32[0];
+    f32[41] = this.gridInfoF32[1];
+    f32[42] = this.gridInfoF32[2];
+    f32[43] = this.gridInfoF32[3];
+
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }
   public recordStepCommands(
@@ -736,41 +710,37 @@ export class FluidSimulationGPU {
 
     const substeps = Math.max(1, config.substeps);
     const subDelta = deltaTime / substeps;
-    const workgroupCount = Math.ceil(this.paddedParticlesCount / 256);
+    const particleWG = Math.ceil(config.numParticles / 256);
+
     for (let step = 0; step < substeps; step++) {
       this.updateUniforms(subDelta);
+
+      const cellWG = Math.ceil(this.gridNumCells / 256);
+      const fusedWG = Math.max(particleWG, cellWG);
 
       const pass = commandEncoder.beginComputePass();
       pass.setBindGroup(0, this.mainBindGroup);
 
       pass.setPipeline(this.pipelines.externalForces);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.dispatchWorkgroups(fusedWG);
 
-      pass.setPipeline(this.pipelines.updateSpatialHash);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.setPipeline(this.pipelines.countParticles);
+      pass.dispatchWorkgroups(particleWG);
 
-      pass.setPipeline(this.pipelines.bitonicSort);
-      for (let s = 0; s < this.bitonicSteps.length; s++) {
-        pass.setBindGroup(1, this.bitonicBindGroup, [
-          s * this.uniformAlignment,
-        ]);
-        pass.dispatchWorkgroups(workgroupCount);
-      }
+      pass.setPipeline(this.pipelines.prefixSumGrid);
+      pass.dispatchWorkgroups(1);
 
-      pass.setPipeline(this.pipelines.clearStartIndices);
-      pass.dispatchWorkgroups(workgroupCount);
-
-      pass.setPipeline(this.pipelines.calculateStartIndices);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.setPipeline(this.pipelines.scatterParticles);
+      pass.dispatchWorkgroups(particleWG);
 
       pass.setPipeline(this.pipelines.calculateDensities);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.dispatchWorkgroups(particleWG);
 
       pass.setPipeline(this.pipelines.calculateForces);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.dispatchWorkgroups(particleWG);
 
       pass.setPipeline(this.pipelines.integratePositions);
-      pass.dispatchWorkgroups(workgroupCount);
+      pass.dispatchWorkgroups(particleWG);
 
       pass.end();
     }

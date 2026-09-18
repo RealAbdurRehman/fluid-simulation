@@ -4,7 +4,7 @@ import { config } from "./config";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
 
 const FAR_DEPTH = 1e6;
-const MAX_BILATERAL_RADIUS_PX = 20;
+const MAX_BILATERAL_RADIUS_PX = 4;
 
 const particleDepthWGSL = /* wgsl */ `
 struct Particle {
@@ -219,13 +219,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const compositeWGSL = /* wgsl */ `
 struct Uniforms {
   sunDirView: vec4<f32>,
-  fluidColor: vec4<f32>,   // rgb = per-channel absorption coefficient
+  fluidColor: vec4<f32>,
   params0: vec4<f32>,
   params1: vec4<f32>,
   params2: vec4<f32>,
   reflSky: vec4<f32>,
   reflHorizon: vec4<f32>,
-  params3: vec4<f32>,      // x = splat world radius, yzw = deep-water scatter color
+  params3: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -265,6 +265,16 @@ fn reconstructViewPos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
   return vec3<f32>(x, y, -depth);
 }
 
+fn projectToUV(viewPos: vec3<f32>) -> vec3<f32> {
+  let th = u.params0.x;
+  let aspect = u.params0.y;
+  let depth = -viewPos.z;
+  let safeDepth = max(depth, 1e-4);
+  let ndcX = viewPos.x / (aspect * th * safeDepth);
+  let ndcY = viewPos.y / (th * safeDepth);
+  return vec3<f32>(ndcX * 0.5 + 0.5, 1.0 - (ndcY * 0.5 + 0.5), depth);
+}
+
 fn waveGradient(p: vec2<f32>, t: f32) -> vec2<f32> {
   var d = vec2<f32>(0.0);
   let a1 = 1.3; let b1 = 0.7;
@@ -282,38 +292,73 @@ fn sampleFakeEnv(ry: f32) -> vec3<f32> {
   let up = clamp(ry, 0.0, 1.0);
   let skyToHorizon = mix(u.reflHorizon.rgb, u.reflSky.rgb, up);
   let below = clamp(-ry, 0.0, 1.0);
-  let groundCol = u.reflHorizon.rgb * 0.6;
+  let groundCol = u.reflHorizon.rgb * 0.55;
   return mix(skyToHorizon, groundCol, below);
 }
 
-// Overlapping SPH particle splats stack along every view ray through the
-// body of the fluid, so the accumulated "thickness" sampled below can be
-// far larger than the fluid's real physical depth, and that path length
-// itself grows a lot at steep viewing angles. Left unclamped, Beer-
-// Lambert absorption on a value like that decays to ~0 for most viewing
-// angles, which is why the pool used to read as solid black/opaque and
-// hid anything submerged in it. Clamping keeps a believable floor on
-// transmittance so deep water gets more tinted/murky instead of fully
-// opaque, and submerged objects stay visible from any angle.
+fn traceSSR(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+  if (dir.z >= 0.0) { return vec4<f32>(0.0); }
+
+  let STEPS: i32 = 6;
+  let MAX_DIST: f32 = 25.0;
+  let stepSize = MAX_DIST / f32(STEPS);
+  let dims = vec2<f32>(textureDimensions(sceneDepth));
+  let dimsMax = dims - vec2<f32>(1.0);
+  let near = u.params0.w;
+  let far = u.params1.x;
+
+  var t = stepSize;
+  for (var i = 0; i < STEPS; i = i + 1) {
+    let samplePos = origin + dir * t;
+    if (samplePos.z >= -1e-3) { break; }
+
+    let proj = projectToUV(samplePos);
+    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0) { break; }
+
+    let px = vec2<i32>(clamp(proj.xy * dims, vec2<f32>(0.0), dimsMax));
+    let raw = textureLoad(sceneDepth, px, 0);
+
+    if (raw < 0.9999) {
+      let sceneLin = linearizeDepth(raw, near, far);
+      if (sceneLin <= proj.z) {
+        let col = textureSampleLevel(sceneColor, linSamp, proj.xy, 0.0).rgb;
+        let fade = 1.0 - f32(i) / f32(STEPS);
+        return vec4<f32>(col, fade * 0.9);
+      }
+    }
+
+    t = t + stepSize;
+  }
+
+  return vec4<f32>(0.0);
+}
+
 const MAX_OPTICAL_DEPTH: f32 = 3.0;
 
-// Fresnel reflectance legitimately climbs toward a full mirror at
-// grazing angles - that's real water behavior - but letting it reach
-// ~1.0 means the reflection can fully replace the refracted image at
-// some angles, hiding submerged objects no matter how shallow they are.
-// Capping it guarantees a minimum amount of the refracted/underwater
-// image always shows through, regardless of viewing angle.
-const MAX_FRESNEL: f32 = 0.35;
+const IOR_AIR: f32 = 1.0;
+const IOR_WATER: f32 = 1.33;
+const MAX_REFRACT_TRAVEL: f32 = 30.0;
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-  let dimsI = vec2<i32>(textureDimensions(fluidDepth));
-  let dimsF = vec2<f32>(dimsI);
-  let coordF = in.uv * dimsF;
-  let coord = vec2<i32>(clamp(vec2<i32>(coordF), vec2<i32>(0), dimsI - vec2<i32>(1)));
+  let sceneDimsI = vec2<i32>(textureDimensions(sceneDepth));
+  let sceneDimsF = vec2<f32>(sceneDimsI);
+  let fluidDimsI = vec2<i32>(textureDimensions(fluidDepth));
+  let fluidDimsF = vec2<f32>(fluidDimsI);
+
+  let sceneCoord = clamp(
+    vec2<i32>(in.uv * sceneDimsF),
+    vec2<i32>(0),
+    sceneDimsI - vec2<i32>(1),
+  );
+  let fluidCoord = clamp(
+    vec2<i32>(in.uv * fluidDimsF),
+    vec2<i32>(0),
+    fluidDimsI - vec2<i32>(1),
+  );
 
   let sceneCol = textureSampleLevel(sceneColor, linSamp, in.uv, 0.0).rgb;
-  let dC = textureLoad(fluidDepth, coord, 0).r;
+  let dC = textureLoad(fluidDepth, fluidCoord, 0).r;
 
   if (dC >= 1e5) {
     return vec4<f32>(sceneCol, 1.0);
@@ -322,7 +367,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let near = u.params0.w;
   let far = u.params1.x;
 
-  let sceneRaw = textureLoad(sceneDepth, coord, 0);
+  let sceneRaw = textureLoad(sceneDepth, sceneCoord, 0);
   if (sceneRaw < 0.9999) {
     let sceneLinear = linearizeDepth(sceneRaw, near, far);
     if (sceneLinear < dC - 0.05) {
@@ -330,23 +375,30 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     }
   }
 
-  let dL = textureLoad(fluidDepth, coord + vec2<i32>(-3, 0), 0).r;
-  let dR = textureLoad(fluidDepth, coord + vec2<i32>( 3, 0), 0).r;
-  let dU = textureLoad(fluidDepth, coord + vec2<i32>(0, -3), 0).r;
-  let dD = textureLoad(fluidDepth, coord + vec2<i32>(0,  3), 0).r;
+  let fluidMax = fluidDimsI - vec2<i32>(1);
+  let dL = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(-1, 0), vec2<i32>(0), fluidMax), 0).r;
+  let dR = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>( 1, 0), vec2<i32>(0), fluidMax), 0).r;
+  let dU = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0, -1), vec2<i32>(0), fluidMax), 0).r;
+  let dD = textureLoad(fluidDepth, clamp(fluidCoord + vec2<i32>(0,  1), vec2<i32>(0), fluidMax), 0).r;
 
   let validL = dL < 1e5;
   let validR = dR < 1e5;
   let validU = dU < 1e5;
   let validD = dD < 1e5;
-  let edgeMask = select(0.0, 1.0, validL && validR && validU && validD);
+
+  var validCount = 0.0;
+  if (validL) { validCount = validCount + 1.0; }
+  if (validR) { validCount = validCount + 1.0; }
+  if (validU) { validCount = validCount + 1.0; }
+  if (validD) { validCount = validCount + 1.0; }
+  let edgeFactor = validCount / 4.0;
 
   let dLv = select(dC, dL, validL);
   let dRv = select(dC, dR, validR);
   let dUv = select(dC, dU, validU);
   let dDv = select(dC, dD, validD);
 
-  let texel = vec2<f32>(3.0) / dimsF;
+  let texel = vec2<f32>(1.0) / fluidDimsF;
   let pC = reconstructViewPos(in.uv, dC);
   let pL = reconstructViewPos(in.uv - vec2<f32>(texel.x, 0.0), dLv);
   let pR = reconstructViewPos(in.uv + vec2<f32>(texel.x, 0.0), dRv);
@@ -369,77 +421,91 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     if (normalSmooth.z < 0.0) { normalSmooth = -normalSmooth; }
   }
 
+  let facing = clamp(abs(normalSmooth.z), 0.0, 1.0);
+
   let pView = reconstructViewPos(in.uv, dC);
   let flatness = smoothstep(0.3, 0.7, dot(normalSmooth, worldUpInView));
   let wave = waveGradient(pView.xy, u.params2.x);
-  var normalShade = normalize(normalSmooth + vec3<f32>(wave * 0.03 * flatness * edgeMask, 0.0));
+  var normalShade = normalize(
+    normalSmooth + vec3<f32>(wave * 0.05 * flatness * edgeFactor * facing, 0.0),
+  );
 
-  let thickness = textureLoad(fluidThickness, coord, 0).r;
+  let thickness = textureLoad(fluidThickness, fluidCoord, 0).r;
   let viewDir = normalize(-reconstructViewPos(in.uv, dC));
 
   let cosTheta = clamp(dot(normalShade, viewDir), 0.0, 1.0);
-  let rawFresnel = u.params1.w + (1.0 - u.params1.w) * pow(1.0 - cosTheta, 5.0);
-  let silhouetteFade = smoothstep(0.3, 0.6, normalShade.z);
-  // Real Fresnel reflectance does climb toward a full mirror at grazing
-  // angles, which is why a straight-down look (near-normal incidence,
-  // low reflectance) reads as more transparent than a shallow, off-axis
-  // look (near-grazing incidence, high reflectance) in most physically
-  // based water shaders. But letting it run all the way to ~1.0 means
-  // the reflection can fully replace the refracted image at some angles
-  // - nothing submerged is visible no matter how shallow it is. Capping
-  // it keeps a believable sheen without ever fully hiding what's below.
-  let fresnel = min(rawFresnel * silhouetteFade * edgeMask, MAX_FRESNEL);
+  let F0 = 0.02;
+  let fresnel = min(F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0), 0.85);
+
+  let baseScatter = u.params3.yzw;
+  let deepScatter = baseScatter * 0.22;
+  let depthMix = 1.0 - exp(-thickness * 0.22);
+  let scatterColor = mix(baseScatter, deepScatter, depthMix);
 
   let refrStr = u.params0.z;
   let thicknessGate = smoothstep(2.0, 6.0, thickness);
-  let sinTheta = sqrt(max(1.0 - normalSmooth.z * normalSmooth.z, 0.0));
-  let refrUV = clamp(
-    in.uv + normalSmooth.xy * refrStr * thicknessGate * sinTheta * edgeMask,
-    vec2<f32>(0.0),
-    vec2<f32>(1.0),
+  let incident = -viewDir;
+  let refrDir = refract(incident, normalSmooth, IOR_AIR / IOR_WATER);
+
+  var refrUV = in.uv;
+  if (dot(refrDir, refrDir) > 1e-6) {
+    let travel = clamp(
+      sqrt(max(thickness, 0.0)) * refrStr,
+      0.0,
+      MAX_REFRACT_TRAVEL,
+    ) * thicknessGate * edgeFactor * facing;
+    let refrPoint = pC + refrDir * travel;
+    let proj = projectToUV(refrPoint);
+    refrUV = clamp(proj.xy, vec2<f32>(0.0), vec2<f32>(1.0));
+  }
+
+  let refrCoordF = refrUV * fluidDimsF;
+  let refrCoord = clamp(
+    vec2<i32>(refrCoordF),
+    vec2<i32>(0),
+    fluidDimsI - vec2<i32>(1),
   );
 
-  let refrCoordF = refrUV * dimsF;
-  let refrCoord = vec2<i32>(clamp(vec2<i32>(refrCoordF), vec2<i32>(0), dimsI - vec2<i32>(1)));
-
   let refrThickness = textureLoad(fluidThickness, refrCoord, 0).r;
-  let refrSceneRaw = textureLoad(sceneDepth, refrCoord, 0);
+  let refrSceneCoord = clamp(
+    vec2<i32>(refrUV * sceneDimsF),
+    vec2<i32>(0),
+    sceneDimsI - vec2<i32>(1),
+  );
+  let refrSceneRaw = textureLoad(sceneDepth, refrSceneCoord, 0);
   let refrValid = refrThickness > 1.0 && refrSceneRaw < 0.9999;
 
   var refracted: vec3<f32>;
   if (refrValid) {
     refracted = textureSampleLevel(sceneColor, linSamp, refrUV, 0.0).rgb;
   } else {
-    refracted = sceneCol;
+    let edgeTint = smoothstep(0.0, 3.0, thickness);
+    refracted = mix(sceneCol, scatterColor, edgeTint);
   }
 
-  // These used to be the same vector, reused for two different jobs:
-  // (1) how fast each color channel gets absorbed with depth (physically,
-  // red should fade fastest and blue slowest - that's why oceans look
-  // blue), and (2) the color of fully opaque water. Job (2) was the bug:
-  // fluidColor is (0.35, 0.15, 0.05) - mostly red, barely any blue - so
-  // as soon as absorb dropped toward 0 the water settled on that dim
-  // reddish-brown instead of a blue. absorptionCoeff keeps the physical
-  // per-channel falloff (unchanged); scatterColor is the actual visible
-  // color of deep/opaque water - the blue you want - and is independent
-  // of the absorption tuning.
   let absorptionCoeff = u.fluidColor.rgb;
-  let scatterColor = u.params3.yzw;
   let opticalDepth = min(sqrt(max(thickness, 0.0)) * u.params1.y, MAX_OPTICAL_DEPTH);
   let absorb = exp(-absorptionCoeff * opticalDepth);
   var col = mix(scatterColor, refracted, absorb);
 
   let R = reflect(-viewDir, normalShade);
   let worldRy = max(dot(R, worldUpInView), 0.0);
-  let reflection = sampleFakeEnv(worldRy);
+  let fakeRefl = sampleFakeEnv(worldRy);
+
+  var reflection = fakeRefl;
+  if (fresnel > 0.04) {
+    let ssr = traceSSR(pC, R);
+    reflection = mix(fakeRefl, ssr.rgb, ssr.a * 0.85);
+  }
   col = mix(col, reflection, fresnel);
 
   let sunVS = normalize(u.sunDirView.xyz);
   let halfVS = normalize(sunVS + viewDir);
   let spec = pow(max(dot(normalShade, halfVS), 0.0), u.params1.z);
-  col = mix(col, vec3<f32>(1.0, 0.98, 0.92), spec * 0.3 * edgeMask * silhouetteFade * silhouetteFade);
+  let specFacing = smoothstep(0.0, 0.4, facing);
+  col = col + vec3<f32>(1.0, 0.98, 0.92) * spec * 0.6 * edgeFactor * specFacing;
 
-  let alpha = smoothstep(0.0, 1.0, thickness);
+  let alpha = clamp((1.0 - exp(-thickness * 1.5)) * edgeFactor, 0.0, 1.0);
   col = mix(sceneCol, col, alpha);
 
   return vec4<f32>(col, 1.0);
@@ -482,18 +548,16 @@ export class SSFRRenderer {
 
   private width = 1;
   private height = 1;
+  private fluidWidth = 1;
+  private fluidHeight = 1;
+
+  private fluidScale = 0.5;
 
   public time = 0;
-
-  // Visible color of fully opaque/deep water (the "in-scattered ambient
-  // light" look). Independent of fluidColor's absorption coefficients
-  // below - tweak this to change the water's overall blue tint without
-  // touching how quickly it absorbs light with depth.
-  public scatterColor: [number, number, number] = [0.04, 0.3, 0.5];
+  public scatterColor: [number, number, number] = [0.07, 0.16, 0.2];
 
   private readonly tmpMat4 = new THREE.Matrix4();
   private readonly tmpVec3 = new THREE.Vector3();
-
   constructor(
     device: GPUDevice,
     format: GPUTextureFormat,
@@ -696,6 +760,8 @@ export class SSFRRenderer {
   public resize(width: number, height: number): void {
     this.width = Math.max(1, width);
     this.height = Math.max(1, height);
+    this.fluidWidth = Math.max(1, Math.floor(this.width * this.fluidScale));
+    this.fluidHeight = Math.max(1, Math.floor(this.height * this.fluidScale));
 
     this.sceneColorTexture?.destroy();
     this.sceneDepthTexture?.destroy();
@@ -705,43 +771,44 @@ export class SSFRRenderer {
     this.fluidDepthSmooth?.destroy();
     this.fluidThicknessTexture?.destroy();
 
-    const size = [this.width, this.height];
+    const sceneSize = [this.width, this.height];
+    const fluidSize = [this.fluidWidth, this.fluidHeight];
 
     this.sceneColorTexture = this.device.createTexture({
-      size,
+      size: sceneSize,
       format: this.format,
       usage:
         GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.sceneDepthTexture = this.device.createTexture({
-      size,
+      size: sceneSize,
       format: "depth32float",
       usage:
         GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.fluidDepthTexture = this.device.createTexture({
-      size,
+      size: fluidSize,
       format: "r32float",
       usage:
         GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.fluidDepthStencil = this.device.createTexture({
-      size,
+      size: fluidSize,
       format: "depth24plus",
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.fluidDepthTemp = this.device.createTexture({
-      size,
+      size: fluidSize,
       format: "r32float",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.fluidDepthSmooth = this.device.createTexture({
-      size,
+      size: fluidSize,
       format: "r32float",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.fluidThicknessTexture = this.device.createTexture({
-      size,
+      size: fluidSize,
       format: "r16float",
       usage:
         GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
@@ -795,6 +862,15 @@ export class SSFRRenderer {
   public getFarDepth(): number {
     return FAR_DEPTH;
   }
+  public setParticleCount(n: number): void {
+    const desired =
+      n <= 10000 ? 0.75 : n <= 24000 ? 0.6 : n <= 48000 ? 0.5 : 0.4;
+    if (desired !== this.fluidScale) {
+      this.fluidScale = desired;
+      if (this.width > 1 && this.height > 1)
+        this.resize(this.width, this.height);
+    }
+  }
   public updateFrame(
     viewMatrix: Float32Array,
     projectionMatrix: Float32Array,
@@ -824,10 +900,8 @@ export class SSFRRenderer {
     pu[43] = 0;
     this.device.queue.writeBuffer(this.particleUniform, 0, pu);
 
-    // const sigmaWorld = splatWorldRadius;
-    // const sigmaDepthWorld = splatWorldRadius;
-    const sigmaWorld = splatWorldRadius * 1.5;
-    const sigmaDepthWorld = splatWorldRadius * 6.0;
+    const sigmaWorld = splatWorldRadius * 1.1;
+    const sigmaDepthWorld = splatWorldRadius * 2.0;
 
     const writeParams = (buffer: GPUBuffer, axis: 0 | 1) => {
       const ab = new ArrayBuffer(32);
@@ -838,7 +912,7 @@ export class SSFRRenderer {
       f[2] = sigmaWorld;
       f[3] = sigmaDepthWorld;
       f[4] = tanHalfFovY;
-      f[5] = this.height;
+      f[5] = this.fluidHeight;
       f[6] = 0;
       f[7] = 0;
       this.device.queue.writeBuffer(buffer, 0, ab);
@@ -857,34 +931,34 @@ export class SSFRRenderer {
     cu[2] = sz;
     cu[3] = 0;
 
-    cu[4] = 0.35;
-    cu[5] = 0.15;
-    cu[6] = 0.05;
+    cu[4] = 0.22;
+    cu[5] = 0.12;
+    cu[6] = 0.07;
     cu[7] = 1.0;
 
     cu[8] = tanHalfFovY;
     cu[9] = aspect;
-    cu[10] = 0.15;
+    cu[10] = 1.4;
     cu[11] = near;
 
     cu[12] = far;
-    cu[13] = 0.15;
+    cu[13] = 0.1;
     cu[14] = 200.0;
-    cu[15] = 0.06;
+    cu[15] = 0.02;
 
     cu[16] = this.time;
     cu[17] = this.tmpVec3.x;
     cu[18] = this.tmpVec3.y;
     cu[19] = this.tmpVec3.z;
 
-    cu[20] = 0.55;
-    cu[21] = 0.75;
-    cu[22] = 0.95;
+    cu[20] = 0.42;
+    cu[21] = 0.55;
+    cu[22] = 0.68;
     cu[23] = 1.0;
 
-    cu[24] = 0.2;
-    cu[25] = 0.35;
-    cu[26] = 0.55;
+    cu[24] = 0.14;
+    cu[25] = 0.24;
+    cu[26] = 0.34;
     cu[27] = 1.0;
 
     cu[28] = splatWorldRadius;
@@ -927,16 +1001,16 @@ export class SSFRRenderer {
     pass.setPipeline(this.bilateralHPipeline);
     pass.setBindGroup(0, this.bilateralHBind);
     pass.dispatchWorkgroups(
-      Math.ceil(this.width / 8),
-      Math.ceil(this.height / 8),
+      Math.ceil(this.fluidWidth / 8),
+      Math.ceil(this.fluidHeight / 8),
     );
   }
   public encodeBilateralV(pass: GPUComputePassEncoder): void {
     pass.setPipeline(this.bilateralVPipeline);
     pass.setBindGroup(0, this.bilateralVBind);
     pass.dispatchWorkgroups(
-      Math.ceil(this.width / 8),
-      Math.ceil(this.height / 8),
+      Math.ceil(this.fluidWidth / 8),
+      Math.ceil(this.fluidHeight / 8),
     );
   }
   public encodeComposite(pass: GPURenderPassEncoder): void {

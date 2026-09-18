@@ -6,11 +6,6 @@ struct Particle {
   density: vec4<f32>,
 };
 
-struct SpatialEntry {
-  particleIndex: u32,
-  cellKey: u32,
-};
-
 struct Collider {
   data0: vec4<f32>,
   rotation: vec4<f32>,
@@ -41,9 +36,9 @@ struct SimParams {
   interactionRayOrigin: vec4<f32>,
   interactionRayDir: vec4<f32>,
   terrainMeta: vec4<f32>,
+  gridInfo: vec4<u32>,
+  gridInfo2: vec4<f32>,
 };
-
-struct BitonicParams { k: u32, j: u32, numEntries: u32, _pad: u32 };
 
 struct ProbeSample {
   density: f32,
@@ -54,15 +49,15 @@ struct ProbeSample {
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
-@group(0) @binding(2) var<storage, read_write> spatialLookup: array<SpatialEntry>;
-@group(0) @binding(3) var<storage, read_write> startIndices: array<u32>;
-@group(0) @binding(4) var<storage, read> colliders: array<Collider>;
-@group(0) @binding(5) var<storage, read> sdfData: array<f32>;
-@group(0) @binding(6) var<storage, read> probePositions: array<vec4<f32>>;
-@group(0) @binding(7) var<storage, read_write> probeSamples: array<ProbeSample>;
-@group(0) @binding(8) var<storage, read> terrain: array<f32>;
+@group(0) @binding(2) var<storage, read> colliders: array<Collider>;
+@group(0) @binding(3) var<storage, read> sdfData: array<f32>;
+@group(0) @binding(4) var<storage, read> probePositions: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> probeSamples: array<ProbeSample>;
+@group(0) @binding(6) var<storage, read> terrain: array<f32>;
+@group(0) @binding(7) var<storage, read_write> grid: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> sortedIndices: array<u32>;
 
-@group(1) @binding(0) var<uniform> bitonicParams: BitonicParams;
+var<workgroup> blockSums: array<u32, 256>;
 
 fn qConjugate(q: vec4<f32>) -> vec4<f32> {
   return vec4<f32>(-q.x, -q.y, -q.z, q.w);
@@ -75,24 +70,39 @@ fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
   return v + ((uv * q.w) + uuv) * 2.0;
 }
 
-fn positionToCellCoord(pos: vec3<f32>, radius: f32) -> vec3<i32> {
-  return vec3<i32>(floor(pos / radius));
+fn gridNumCells() -> u32 { return params.gridInfo.x; }
+fn gridSizeU() -> u32 { return params.gridInfo.y; }
+fn gridSearchRadius() -> i32 { return i32(params.gridInfo.z); }
+fn gridCellSize() -> f32 { return params.gridInfo2.x; }
+
+fn worldToLocal(worldPos: vec3<f32>) -> vec3<f32> {
+  let container = colliders[0];
+  let invRot = qConjugate(container.rotation);
+  return qRotateVec(invRot, worldPos - container.data0.xyz);
 }
 
-fn hashCell(cell: vec3<i32>) -> u32 {
-  let ux = u32(cell.x) * 73856093u;
-  let uy = u32(cell.y) * 19349663u;
-  let uz = u32(cell.z) * 83492791u;
-  return ux ^ uy ^ uz;
+fn localToCell(localPos: vec3<f32>) -> vec3<i32> {
+  let gs = f32(gridSizeU());
+  let half = gs * 0.5;
+  let c = floor(localPos / gridCellSize() + vec3<f32>(half));
+  return vec3<i32>(clamp(c, vec3<f32>(0.0), vec3<f32>(gs - 1.0)));
 }
 
-fn getKeyFromHash(hash: u32, tableSize: u32) -> u32 {
-  return hash % tableSize;
+fn cellToIndex(cell: vec3<i32>) -> u32 {
+  let gs = gridSizeU();
+  return u32(cell.x) + u32(cell.y) * gs + u32(cell.z) * gs * gs;
 }
+
+fn gridRead(i: u32) -> u32 { return atomicLoad(&grid[i]); }
 
 @compute @workgroup_size(256)
 fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x;
+
+  if (index < gridNumCells()) {
+    atomicStore(&grid[index], 0u);
+  }
+
   if (index >= params.numParticles) { return; }
 
   var vel = particles[index].velocity.xyz;
@@ -121,95 +131,67 @@ fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 
   particles[index].velocity = vec4<f32>(vel, 0.0);
-  particles[index].predictedPosition = vec4<f32>(pos + vel * (1.0 / 60.0), 0.0);
+  particles[index].predictedPosition =
+    vec4<f32>(pos + vel * params.deltaTime, 0.0);
 }
 
 @compute @workgroup_size(256)
-fn updateSpatialHash(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.tableSize) { return; }
-
-  if (index < params.numParticles) {
-    let cellCoord = positionToCellCoord(particles[index].predictedPosition.xyz, params.smoothingRadius);
-    let key = getKeyFromHash(hashCell(cellCoord), params.tableSize);
-    spatialLookup[index] = SpatialEntry(index, key);
-  } else {
-    spatialLookup[index] = SpatialEntry(0xFFFFFFFFu, 0xFFFFFFFFu);
-  }
-}
-
-@compute @workgroup_size(256)
-fn bitonicSort(@builtin(global_invocation_id) id: vec3<u32>) {
+fn countParticles(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x;
-  if (i >= bitonicParams.numEntries) { return; }
+  if (i >= params.numParticles) { return; }
+  let pos = particles[i].predictedPosition.xyz;
+  let ci = cellToIndex(localToCell(worldToLocal(pos)));
+  atomicAdd(&grid[ci], 1u);
+}
 
-  let k = bitonicParams.k;
-  let j = bitonicParams.j;
+@compute @workgroup_size(256)
+fn prefixSumGrid(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+  let n = gridNumCells();
+  let chunk = (n + 255u) / 256u;
+  let start = tid * chunk;
+  let end = min(start + chunk, n);
 
-  let l = i ^ j;
-  if (l > i && l < bitonicParams.numEntries) {
-    let ascending = (i & k) == 0u;
-    let entryA = spatialLookup[i];
-    let entryB = spatialLookup[l];
+  var sum: u32 = 0u;
+  for (var i = start; i < end; i = i + 1u) {
+    let v = atomicLoad(&grid[i]);
+    atomicStore(&grid[i], sum);
+    sum = sum + v;
+  }
+  blockSums[tid] = sum;
+  workgroupBarrier();
 
-    if ((entryA.cellKey > entryB.cellKey) == ascending) {
-      spatialLookup[i] = entryB;
-      spatialLookup[l] = entryA;
-    }
+  var step: u32 = 1u;
+  for (var s = 0u; s < 8u; s = s + 1u) {
+    var v: u32 = 0u;
+    if (tid >= step) { v = blockSums[tid - step]; }
+    workgroupBarrier();
+    blockSums[tid] = blockSums[tid] + v;
+    workgroupBarrier();
+    step = step * 2u;
+  }
+
+  let offset = select(0u, blockSums[tid - 1u], tid > 0u);
+
+  for (var i = start; i < end; i = i + 1u) {
+    let v = atomicLoad(&grid[i]) + offset;
+    atomicStore(&grid[i], v);
+    atomicStore(&grid[n + 1u + i], v);
+  }
+
+  if (tid == 0u) {
+    atomicStore(&grid[n], params.numParticles);
   }
 }
 
 @compute @workgroup_size(256)
-fn clearStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index < params.tableSize) { startIndices[index] = 0xFFFFFFFFu; }
-}
-
-@compute @workgroup_size(256)
-fn calculateStartIndices(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= params.numParticles) { return; }
-
-  let key = spatialLookup[index].cellKey;
-  let prevKey = select(spatialLookup[index - 1u].cellKey, 0xFFFFFFFFu, index == 0u);
-  if (key != prevKey && key < params.tableSize) { startIndices[key] = index; }
-}
-
-fn densityKernel(radius: f32, dist: f32) -> f32 {
-  if (dist >= radius) { return 0.0; }
-  let v = radius - dist;
-  return v * v * params.poly6Factor;
-}
-
-fn nearDensityKernel(radius: f32, dist: f32) -> f32 {
-  if (dist >= radius) { return 0.0; }
-  let v = radius - dist;
-  return v * v * v * params.nearSpikyGradFactor;
-}
-
-fn densityToPressure(density: f32) -> f32 {
-  return (density - params.targetDensity) * params.pressureMultiplier;
-}
-
-fn nearDensityToPressure(nearDensity: f32) -> f32 {
-  return nearDensity * params.nearPressureMultiplier;
-}
-
-fn densityKernelDerivative(radius: f32, dist: f32) -> f32 {
-  if (dist >= radius) { return 0.0; }
-  return (dist - radius) * params.spikyGradFactor;
-}
-
-fn nearDensityKernelDerivative(radius: f32, dist: f32) -> f32 {
-  if (dist >= radius) { return 0.0; }
-  let v = radius - dist;
-  return -v * v * params.nearSpikyGradFactor;
-}
-
-fn viscosityKernel(radius: f32, dist: f32) -> f32 {
-  if (dist >= radius) { return 0.0; }
-  let v = radius - dist;
-  return v * v * params.viscFactor;
+fn scatterParticles(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= params.numParticles) { return; }
+  let pos = particles[i].predictedPosition.xyz;
+  let ci = cellToIndex(localToCell(worldToLocal(pos)));
+  let slot = atomicAdd(&grid[gridNumCells() + 1u + ci], 1u);
+  sortedIndices[slot] = i;
 }
 
 @compute @workgroup_size(256)
@@ -218,35 +200,46 @@ fn calculateDensities(@builtin(global_invocation_id) id: vec3<u32>) {
   if (index >= params.numParticles) { return; }
 
   let pos = particles[index].predictedPosition.xyz;
-  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
+  let centerCell = localToCell(worldToLocal(pos));
   let radius = params.smoothingRadius;
   let radiusSqr = radius * radius;
+  let search = gridSearchRadius();
+  let gs = i32(gridSizeU());
+  let gsSq = gs * gs;
+  let ciCenter = i32(cellToIndex(centerCell));
+
+  let massPoly6 = params.particleMass * params.poly6Factor;
+  let massNear = params.particleMass * params.nearSpikyGradFactor;
 
   var density = 0.0;
   var nearDensity = 0.0;
 
-  for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
-    for (var offsetY = -1; offsetY <= 1; offsetY++) {
-      for (var offsetX = -1; offsetX <= 1; offsetX++) {
-        let neighborCell = centerCell + vec3<i32>(offsetX, offsetY, offsetZ);
-        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
-        let startIndex = startIndices[key];
+  for (var oz = -search; oz <= search; oz++) {
+    let zc = centerCell.z + oz;
+    if (zc < 0 || zc >= gs) { continue; }
+    let zOff = oz * gsSq;
+    for (var oy = -search; oy <= search; oy++) {
+      let yc = centerCell.y + oy;
+      if (yc < 0 || yc >= gs) { continue; }
+      let yOff = oy * gs;
+      for (var ox = -search; ox <= search; ox++) {
+        let xc = centerCell.x + ox;
+        if (xc < 0 || xc >= gs) { continue; }
+        let ci = u32(ciCenter + ox + yOff + zOff);
+        let s = gridRead(ci);
+        let e = gridRead(ci + 1u);
 
-        if (startIndex != 0xFFFFFFFFu) {
-          for (var i = startIndex; i < params.numParticles; i++) {
-            let entry = spatialLookup[i];
-            if (entry.cellKey != key) { break; }
-
-            let neighborIndex = entry.particleIndex;
-            let neighborPos = particles[neighborIndex].predictedPosition.xyz;
-            let diff = neighborPos - pos;
-            let distSqr = dot(diff, diff);
-
-            if (distSqr <= radiusSqr) {
-              let dist = sqrt(distSqr);
-              density += params.particleMass * densityKernel(radius, dist);
-              nearDensity += params.particleMass * nearDensityKernel(radius, dist);
-            }
+        for (var i = s; i < e; i = i + 1u) {
+          let ni = sortedIndices[i];
+          let nPos = particles[ni].predictedPosition.xyz;
+          let diff = nPos - pos;
+          let d2 = dot(diff, diff);
+          if (d2 <= radiusSqr) {
+            let d = sqrt(d2);
+            let v = radius - d;
+            let v2 = v * v;
+            density += v2 * massPoly6;
+            nearDensity += v2 * v * massNear;
           }
         }
       }
@@ -489,6 +482,11 @@ fn resolveTerrain(
   var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
 
   let baseY = -params.boundsHeight * 0.5;
+  let maxTerrainTop = baseY + params.terrainMeta.z + radius;
+  if (localPos.y >= maxTerrainTop) {
+    return r;
+  }
+
   let surfY = baseY + terrainHeightAt(localPos.x, localPos.z);
 
   let extX = params.terrainMeta.y;
@@ -531,62 +529,83 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let density = densityData.x;
   let nearDensity = densityData.y;
 
-  let pressure = densityToPressure(density);
-  let nearPressure = nearDensityToPressure(nearDensity);
+  let targetDensity = params.targetDensity;
+  let pressureMul = params.pressureMultiplier;
+  let nearPressureMul = params.nearPressureMultiplier;
 
-  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
+  let pressure = (density - targetDensity) * pressureMul;
+  let nearPressure = nearDensity * nearPressureMul;
+
+  let centerCell = localToCell(worldToLocal(pos));
   let radius = params.smoothingRadius;
   let radiusSqr = radius * radius;
+  let search = gridSearchRadius();
+  let gs = i32(gridSizeU());
+  let gsSq = gs * gs;
+  let ciCenter = i32(cellToIndex(centerCell));
+
+  let mass = params.particleMass;
+  let spiky = params.spikyGradFactor;
+  let nearSpiky = params.nearSpikyGradFactor;
+  let viscFactor = params.viscFactor;
+  let dt = params.deltaTime;
+  let invDt = 1.0 / max(dt, 0.0001);
+  let viscScale = params.viscosityStrength * dt;
 
   var pressureForce = vec3<f32>(0.0);
   var viscosityForce = vec3<f32>(0.0);
 
-  for (var offsetZ = -1; offsetZ <= 1; offsetZ++) {
-    for (var offsetY = -1; offsetY <= 1; offsetY++) {
-      for (var offsetX = -1; offsetX <= 1; offsetX++) {
-        let neighborCell = centerCell + vec3<i32>(offsetX, offsetY, offsetZ);
-        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
-        let startIndex = startIndices[key];
+  for (var oz = -search; oz <= search; oz++) {
+    let zc = centerCell.z + oz;
+    if (zc < 0 || zc >= gs) { continue; }
+    let zOff = oz * gsSq;
+    for (var oy = -search; oy <= search; oy++) {
+      let yc = centerCell.y + oy;
+      if (yc < 0 || yc >= gs) { continue; }
+      let yOff = oy * gs;
+      for (var ox = -search; ox <= search; ox++) {
+        let xc = centerCell.x + ox;
+        if (xc < 0 || xc >= gs) { continue; }
+        let ci = u32(ciCenter + ox + yOff + zOff);
+        let s = gridRead(ci);
+        let e = gridRead(ci + 1u);
 
-        if (startIndex != 0xFFFFFFFFu) {
-          for (var i = startIndex; i < params.numParticles; i++) {
-            let entry = spatialLookup[i];
-            if (entry.cellKey != key) { break; }
+        for (var i = s; i < e; i = i + 1u) {
+          let neighborIndex = sortedIndices[i];
+          if (neighborIndex == index) { continue; }
 
-            let neighborIndex = entry.particleIndex;
-            if (neighborIndex == index) { continue; }
+          let neighborPos = particles[neighborIndex].predictedPosition.xyz;
+          let diff = neighborPos - pos;
+          let distSqr = dot(diff, diff);
 
-            let neighborPos = particles[neighborIndex].predictedPosition.xyz;
-            let diff = neighborPos - pos;
-            let distSqr = dot(diff, diff);
+          if (distSqr <= radiusSqr) {
+            let dist = max(sqrt(distSqr), 0.001);
+            let dir = diff / dist;
 
-            if (distSqr <= radiusSqr) {
-              let dist = max(sqrt(distSqr), 0.001);
-              let dir = diff / dist;
+            let nd = particles[neighborIndex].density;
+            let neighborDensity = nd.x;
+            let neighborNearDensity = nd.y;
 
-              let neighborDensityData = particles[neighborIndex].density;
-              let neighborDensity = neighborDensityData.x;
-              let neighborNearDensity = neighborDensityData.y;
-
-              if (neighborDensity > 0.0) {
-                let neighborPressure = densityToPressure(neighborDensity);
-                let sharedPressure = (pressure + neighborPressure) * 0.5;
-                let slope = densityKernelDerivative(radius, dist);
-                pressureForce += dir * (sharedPressure * slope * params.particleMass / neighborDensity);
-              }
-
-              if (neighborNearDensity > 0.0) {
-                let neighborNearPressure = nearDensityToPressure(neighborNearDensity);
-                let sharedNearPressure = (nearPressure + neighborNearPressure) * 0.5;
-                let nearSlope = nearDensityKernelDerivative(radius, dist);
-                pressureForce += dir * (sharedNearPressure * nearSlope * params.particleMass / neighborNearDensity);
-              }
-
-              let neighborVel = particles[neighborIndex].velocity.xyz;
-              let viscWeight = viscosityKernel(radius, dist);
-              let viscDamping = min(viscWeight * params.viscosityStrength * params.deltaTime, 0.40) / max(params.deltaTime, 0.0001);
-              viscosityForce += (neighborVel - vel) * viscDamping;
+            if (neighborDensity > 0.0) {
+              let neighborPressure = (neighborDensity - targetDensity) * pressureMul;
+              let sharedPressure = (pressure + neighborPressure) * 0.5;
+              let slope = (dist - radius) * spiky;
+              pressureForce += dir * (sharedPressure * slope * mass / neighborDensity);
             }
+
+            if (neighborNearDensity > 0.0) {
+              let neighborNearPressure = neighborNearDensity * nearPressureMul;
+              let sharedNearPressure = (nearPressure + neighborNearPressure) * 0.5;
+              let vNear = radius - dist;
+              let nearSlope = -vNear * vNear * nearSpiky;
+              pressureForce += dir * (sharedNearPressure * nearSlope * mass / neighborNearDensity);
+            }
+
+            let neighborVel = particles[neighborIndex].velocity.xyz;
+            let vVisc = radius - dist;
+            let viscWeight = vVisc * vVisc * viscFactor;
+            let viscDamping = min(viscWeight * viscScale, 0.40) * invDt;
+            viscosityForce += (neighborVel - vel) * viscDamping;
           }
         }
       }
@@ -650,33 +669,43 @@ fn sampleProbes(@builtin(global_invocation_id) id: vec3<u32>) {
   if (idx >= params.numProbes) { return; }
 
   let pos = probePositions[idx].xyz;
-  let centerCell = positionToCellCoord(pos, params.smoothingRadius);
+  let centerCell = localToCell(worldToLocal(pos));
   let radius = params.smoothingRadius;
   let radiusSqr = radius * radius;
+  let search = gridSearchRadius();
+  let gs = i32(gridSizeU());
+  let gsSq = gs * gs;
+  let ciCenter = i32(cellToIndex(centerCell));
+  let massPoly6 = params.particleMass * params.poly6Factor;
 
   var density = 0.0;
   var weightedVel = vec3<f32>(0.0);
   var weightSum = 0.0;
 
-  for (var oz = -1; oz <= 1; oz++) {
-    for (var oy = -1; oy <= 1; oy++) {
-      for (var ox = -1; ox <= 1; ox++) {
-        let neighborCell = centerCell + vec3<i32>(ox, oy, oz);
-        let key = getKeyFromHash(hashCell(neighborCell), params.tableSize);
-        let startIndex = startIndices[key];
-        if (startIndex == 0xFFFFFFFFu) { continue; }
+  for (var oz = -search; oz <= search; oz++) {
+    let zc = centerCell.z + oz;
+    if (zc < 0 || zc >= gs) { continue; }
+    let zOff = oz * gsSq;
+    for (var oy = -search; oy <= search; oy++) {
+      let yc = centerCell.y + oy;
+      if (yc < 0 || yc >= gs) { continue; }
+      let yOff = oy * gs;
+      for (var ox = -search; ox <= search; ox++) {
+        let xc = centerCell.x + ox;
+        if (xc < 0 || xc >= gs) { continue; }
+        let ci = u32(ciCenter + ox + yOff + zOff);
+        let s = gridRead(ci);
+        let e = gridRead(ci + 1u);
 
-        for (var i = startIndex; i < params.numParticles; i++) {
-          let entry = spatialLookup[i];
-          if (entry.cellKey != key) { break; }
-
-          let nIdx = entry.particleIndex;
+        for (var i = s; i < e; i = i + 1u) {
+          let nIdx = sortedIndices[i];
           let nPos = particles[nIdx].predictedPosition.xyz;
           let diff = nPos - pos;
           let d2 = dot(diff, diff);
           if (d2 <= radiusSqr) {
             let d = sqrt(d2);
-            let w = densityKernel(radius, d) * params.particleMass;
+            let v = radius - d;
+            let w = v * v * massPoly6;
             density += w;
             weightedVel += particles[nIdx].velocity.xyz * w;
             weightSum += w;
