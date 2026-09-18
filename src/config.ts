@@ -1,5 +1,7 @@
 import * as THREE from "three";
+
 import GUI from "lil-gui";
+import { MODEL_IDS } from "./models";
 
 export interface SimulationPreset {
   name: string;
@@ -53,10 +55,8 @@ export const PRESETS: Record<string, SimulationPreset> = {
   },
 };
 
-export type ObjectShapeType = "none" | "sphere" | "box" | "torusKnot";
-
 export interface ObjectSlotConfig {
-  type: ObjectShapeType;
+  modelId: string;
   posX: number;
   posY: number;
   posZ: number;
@@ -73,7 +73,7 @@ function makeObjectSlot(
   overrides: Partial<ObjectSlotConfig> = {},
 ): ObjectSlotConfig {
   return {
-    type: "none",
+    modelId: "none",
     posX: 0,
     posY: 0,
     posZ: 0,
@@ -169,7 +169,7 @@ export const config = {
 
   objects: [
     makeObjectSlot({
-      type: "sphere",
+      modelId: "sphere",
       posX: -3.5,
       posY: 0.5,
       posZ: 0.5,
@@ -179,7 +179,7 @@ export const config = {
       angularDrag: 2.0,
     }),
     makeObjectSlot({
-      type: "box",
+      modelId: "box",
       posX: 3.0,
       posY: 2.5,
       posZ: -1.0,
@@ -292,6 +292,33 @@ function addSceneFolder(
     .add(config, "terrainEnabled")
     .name("Terrain")
     .onChange(onRegenerateTerrain);
+
+  const terrain = folder.addFolder("Terrain Detail");
+  terrain
+    .add(config, "terrainResolution", 32, 512, 32)
+    .name("Resolution")
+    .onChange(onRegenerateTerrain);
+  terrain
+    .add(config, "terrainHeightScale", 0.5, 30, 0.1)
+    .name("Height Scale")
+    .onChange(onRegenerateTerrain);
+  terrain
+    .add(config, "terrainSeed", 0, 100000, 1)
+    .name("Seed")
+    .onChange(onRegenerateTerrain);
+  terrain
+    .add(
+      {
+        regen: () => {
+          config.terrainSeed = Math.floor(Math.random() * 100000);
+          gui.controllersRecursive().forEach((c) => c.updateDisplay());
+          onRegenerateTerrain();
+        },
+      },
+      "regen",
+    )
+    .name("Randomize");
+
   folder
     .add(config, "boundsWidth", 4, 40, 1)
     .name("Width")
@@ -311,12 +338,17 @@ function addObjectFolders(
   onObjectChanged: (index: number) => void,
   onSpawnObject: (index: number) => void,
 ): void {
+  const modelOptions = ["none", ...MODEL_IDS];
+  const maxSize =
+    Math.min(config.boundsWidth, config.boundsHeight, config.boundsDepth) * 0.2;
+
   config.objects.forEach((slot, index) => {
     const folder = gui.addFolder(`Object ${index + 1}`);
     folder
-      .add(slot, "type", ["none", "sphere", "box", "torusKnot"])
-      .name("Shape")
+      .add(slot, "modelId", modelOptions)
+      .name("Model")
       .onChange(() => onObjectChanged(index));
+    folder.add(slot, "size", 0.1, maxSize, 0.05).name("Size");
     folder
       .add(slot, "densityRatio", 0.05, 4.0, 0.05)
       .name("Density (rel. fluid)");

@@ -38,12 +38,7 @@ async function bootstrap(): Promise<void> {
   );
 
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
-  meshRegistry.register(
-    "torusKnot",
-    new THREE.TorusKnotGeometry(1, 0.35, 160, 24),
-  );
-  meshRegistry.register("sphere", new THREE.SphereGeometry(1, 32, 16));
-  meshRegistry.register("box", new THREE.BoxGeometry(2, 2, 2));
+  await meshRegistry.preloadAll();
 
   const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
 
@@ -53,6 +48,8 @@ async function bootstrap(): Promise<void> {
     if (!config.terrainEnabled) {
       simulation.setTerrain(null);
       sceneRenderer.setTerrainMesh(null);
+      updaters.setTerrain(null, 0);
+
       return;
     }
 
@@ -66,9 +63,10 @@ async function bootstrap(): Promise<void> {
     );
 
     simulation.setTerrain(data);
+    updaters.setTerrain(data, baseY);
 
     const id = `terrain_${terrainMeshCounter++}`;
-    meshRegistry.register(id, terrainToGeometry(data, baseY));
+    meshRegistry.registerTerrain(id, terrainToGeometry(data, baseY));
     sceneRenderer.setTerrainMesh(id);
   }
 
@@ -89,7 +87,7 @@ async function bootstrap(): Promise<void> {
   regenerateTerrain();
 
   for (let i = 0; i < config.objects.length; i++) {
-    if (config.objects[i].type !== "none") {
+    if (config.objects[i].modelId !== "none") {
       updaters.requestBakeForSlot(i);
       updaters.spawnObject(i);
     }

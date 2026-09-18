@@ -1,31 +1,73 @@
 import * as THREE from "three";
 import type { FluidSimulationGPU, BakedMeshHandle } from "./simulation";
 import type { SceneRenderer } from "./sceneRenderer";
+import { MODELS, type ModelDef } from "./models";
+import { loadModel, type LoadedModel } from "./modelLoader";
 
 export const MESH_BAKE_RESOLUTION = 64;
-export const MESH_BAKE_PADDING = 0.75;
+export const MESH_BAKE_PADDING = 1.2;
 
 export class MeshRegistry {
   private readonly simulation: FluidSimulationGPU;
   private readonly sceneRenderer: SceneRenderer;
   private geometries = new Map<string, THREE.BufferGeometry>();
+  private loaded = new Map<string, LoadedModel>();
+  private loadPromises = new Map<string, Promise<LoadedModel>>();
+  private failed = new Set<string>();
   constructor(simulation: FluidSimulationGPU, sceneRenderer: SceneRenderer) {
     this.simulation = simulation;
     this.sceneRenderer = sceneRenderer;
   }
-  register(id: string, geometry: THREE.BufferGeometry): void {
+  async ensure(id: string): Promise<LoadedModel | null> {
+    if (this.failed.has(id)) return null;
+
+    const existing = this.loaded.get(id);
+    if (existing) return existing;
+
+    const inflight = this.loadPromises.get(id);
+    if (inflight) return inflight;
+
+    const def = MODELS[id];
+    if (!def) return null;
+
+    const promise = this.runLoad(id, def);
+    this.loadPromises.set(id, promise);
+    return promise;
+  }
+  private async runLoad(id: string, def: ModelDef): Promise<LoadedModel> {
+    try {
+      const model = await loadModel(def);
+
+      this.loaded.set(id, model);
+      this.geometries.set(id, model.geometry);
+      this.sceneRenderer.registerMesh(id, model.geometry);
+
+      await this.simulation
+        .bakeMesh(model.geometry, MESH_BAKE_RESOLUTION, MESH_BAKE_PADDING)
+        .catch((err) => console.error(`SDF bake failed for "${id}":`, err));
+
+      return model;
+    } catch (err) {
+      this.failed.add(id);
+      throw err;
+    } finally {
+      this.loadPromises.delete(id);
+    }
+  }
+  async preloadAll(): Promise<void> {
+    await Promise.all(
+      Object.keys(MODELS).map((id) =>
+        this.ensure(id).catch((err) =>
+          console.error(`Failed to load model "${id}":`, err),
+        ),
+      ),
+    );
+  }
+  registerTerrain(id: string, geometry: THREE.BufferGeometry): void {
     if (this.geometries.has(id)) return;
 
     this.geometries.set(id, geometry);
     this.sceneRenderer.registerMesh(id, geometry);
-  }
-  ensure(id: string): void {
-    const geometry = this.geometries.get(id);
-    if (!geometry) return;
-
-    this.simulation
-      .bakeMesh(geometry, MESH_BAKE_RESOLUTION, MESH_BAKE_PADDING)
-      .catch((err) => console.error(`SDF bake failed for "${id}":`, err));
   }
   get(id: string): BakedMeshHandle | null {
     const geometry = this.geometries.get(id);
@@ -36,5 +78,8 @@ export class MeshRegistry {
       MESH_BAKE_RESOLUTION,
       MESH_BAKE_PADDING,
     );
+  }
+  getLoaded(id: string): LoadedModel | null {
+    return this.loaded.get(id) ?? null;
   }
 }
