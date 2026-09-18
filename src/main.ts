@@ -38,7 +38,7 @@ async function bootstrap(): Promise<void> {
   );
 
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
-  await meshRegistry.preloadAll();
+  meshRegistry.preloadAll();
 
   const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
 

@@ -92,6 +92,7 @@ export class FluidSimulationGPU {
   private probeMapInFlight = false;
   private probeCount = 0;
   private latestProbes: Float32Array | null = null;
+  private latestProbesProbeCount = -1;
 
   private pipelines: Record<ComputeEntryPoint, GPUComputePipeline> =
     {} as never;
@@ -376,17 +377,24 @@ export class FluidSimulationGPU {
     return this.particlesBuffer;
   }
   public setProbes(positions: Float32Array, count: number): void {
-    this.probeCount = Math.min(count, MAX_PROBES);
+    const newCount = Math.min(count, MAX_PROBES);
+    if (newCount !== this.probeCount) {
+      this.latestProbes = null;
+      this.latestProbesProbeCount = -1;
+    }
+    this.probeCount = newCount;
     if (this.probeCount === 0) return;
     this.device.queue.writeBuffer(
       this.probeInputBuffer,
       0,
       positions,
       0,
-      this.probeCount * 4,
+      this.probeCount * PROBE_BYTES,
     );
   }
   public getLatestProbes(): Float32Array | null {
+    if (this.latestProbes === null) return null;
+    if (this.latestProbesProbeCount !== this.probeCount) return null;
     return this.latestProbes;
   }
   public pollProbeResults(): void {
@@ -405,6 +413,7 @@ export class FluidSimulationGPU {
         const mapped = this.probeReadbackBuffer.getMappedRange(0, byteCount);
 
         this.latestProbes = new Float32Array(mapped).slice();
+        this.latestProbesProbeCount = this.probeCount;
         this.probeReadbackBuffer.unmap();
         this.probeMapInFlight = false;
       })

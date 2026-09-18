@@ -400,6 +400,14 @@ fn queryMesh(collider: Collider, worldPos: vec3<f32>) -> MeshQuery {
   q.dist = 1e9;
   q.worldNormal = vec3<f32>(0.0, 1.0, 0.0);
 
+  let center = collider.data0.xyz;
+  if (!(center.x == center.x) || !(center.y == center.y) || !(center.z == center.z)) {
+    return q;
+  }
+  if (!(worldPos.x == worldPos.x) || !(worldPos.y == worldPos.y) || !(worldPos.z == worldPos.z)) {
+    return q;
+  }
+
   let invRot = qConjugate(collider.rotation);
   let scale = max(collider.data2.x, 0.0001);
   let localPos = qRotateVec(invRot, worldPos - collider.data0.xyz) / scale;

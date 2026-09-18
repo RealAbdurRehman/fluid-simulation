@@ -389,10 +389,14 @@ function createObjectsUpdater(
     const centerSub = _tmpVecA.set(0, 0, 0);
     const avgFluidVel = _tmpVecB.set(0, 0, 0);
 
-    if (probeResults) {
+    const neededFloats = (probeBase + probeTotal) * 4;
+    const hasData =
+      probeResults !== null && probeResults.length >= neededFloats;
+
+    if (hasData) {
       for (let p = 0; p < probeTotal; p++) {
         const o = (probeBase + p) * 4;
-        const density = probeResults[o + 0];
+        const density = probeResults![o + 0];
         const sub = THREE.MathUtils.clamp(density / localRho, 0, 1);
 
         _hullTmp.set(
@@ -402,9 +406,9 @@ function createObjectsUpdater(
         );
 
         centerSub.addScaledVector(_hullTmp, sub);
-        avgFluidVel.x += probeResults[o + 1] * sub;
-        avgFluidVel.y += probeResults[o + 2] * sub;
-        avgFluidVel.z += probeResults[o + 3] * sub;
+        avgFluidVel.x += probeResults![o + 1] * sub;
+        avgFluidVel.y += probeResults![o + 2] * sub;
+        avgFluidVel.z += probeResults![o + 3] * sub;
         submergedSum += sub;
       }
     }
@@ -431,7 +435,7 @@ function createObjectsUpdater(
       Math.max(0, 1 - AIR_ANGULAR_DAMPING * dt),
     );
 
-    if (submergedFraction > 1e-3 && probeResults && submergedSum > 1e-6) {
+    if (hasData && submergedFraction > 1e-3 && submergedSum > 1e-6) {
       centerSub.divideScalar(submergedSum);
       avgFluidVel.divideScalar(submergedSum);
 
@@ -483,6 +487,23 @@ function createObjectsUpdater(
     const angSpeed = body.angularVelocity.length();
     if (angSpeed > MAX_ANGULAR_SPEED)
       body.angularVelocity.multiplyScalar(MAX_ANGULAR_SPEED / angSpeed);
+
+    if (
+      !Number.isFinite(body.position.x) ||
+      !Number.isFinite(body.position.y) ||
+      !Number.isFinite(body.position.z) ||
+      !Number.isFinite(body.linearVelocity.x) ||
+      !Number.isFinite(body.linearVelocity.y) ||
+      !Number.isFinite(body.linearVelocity.z) ||
+      !Number.isFinite(body.angularVelocity.x) ||
+      !Number.isFinite(body.angularVelocity.y) ||
+      !Number.isFinite(body.angularVelocity.z)
+    ) {
+      body.position.set(slot.posX, slot.posY, slot.posZ);
+      body.linearVelocity.set(0, 0, 0);
+      body.angularVelocity.set(0, 0, 0);
+      body.quaternion.set(0, 0, 0, 1);
+    }
   }
 
   function clampToBounds(
@@ -720,7 +741,9 @@ function createObjectsUpdater(
           const invMB = 1 / Math.max(B.body.mass, 1e-6);
           const totalInvM = invMA + invMB;
 
-          const corr = (overlap * 0.8) / totalInvM;
+          const maxCorr = Math.min(sizeA, sizeB) * 0.25;
+          const correction = Math.min(overlap * 0.5, maxCorr);
+          const corr = correction / totalInvM;
           A.body.position.addScaledVector(_pairAxis, -corr * invMA);
           B.body.position.addScaledVector(_pairAxis, corr * invMB);
 
