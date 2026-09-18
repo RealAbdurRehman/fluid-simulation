@@ -30,6 +30,7 @@ struct LightUniforms {
 @group(2) @binding(0) var<uniform> light: LightUniforms;
 @group(2) @binding(1) var lightDepth: texture_2d<f32>;
 @group(2) @binding(2) var lightThickness: texture_2d<f32>;
+@group(2) @binding(3) var causticTex: texture_2d<f32>;
 
 fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
   let qv = q.xyz;
@@ -81,6 +82,31 @@ fn computeShadow(worldPos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
   return mix(vec3<f32>(1.0), max(tinted, vec3<f32>(0.35)), backfaceMask);
 }
 
+fn computeCaustics(worldPos: vec3<f32>, worldNormal: vec3<f32>) -> f32 {
+  if (worldNormal.y < 0.1) { return 1.0; }
+
+  let lp = light.viewProj * vec4<f32>(worldPos, 1.0);
+  let w = max(abs(lp.w), 1e-6);
+  let ndc = lp.xyz / w;
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) {
+    return 1.0;
+  }
+
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let dims = vec2<f32>(textureDimensions(causticTex));
+  let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+
+  let sample2 = textureLoad(causticTex, px, 0);
+  let fluidDepth = sample2.g;
+  if (fluidDepth >= 1e5) { return 1.0; }
+
+  let lv = light.view * vec4<f32>(worldPos, 1.0);
+  let recZ = -lv.z;
+  if (recZ < fluidDepth - 0.15) { return 1.0; }
+
+  return sample2.r;
+}
+
 struct MeshVIn {
   @location(0) position: vec3<f32>,
   @location(1) normal: vec3<f32>,
@@ -112,9 +138,10 @@ fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
   let viewDir = normalize(frame.cameraPos.xyz - input.worldPos);
 
   let shadow = computeShadow(input.worldPos, n);
+  let caustic = computeCaustics(input.worldPos, n);
 
   let ambient = vec3<f32>(0.30, 0.36, 0.44);
-  let direct = obj.color.rgb * (ndl * 0.95) * shadow;
+  let direct = obj.color.rgb * (ndl * 0.95) * shadow * caustic;
 
   var lit = obj.color.rgb * ambient + direct;
 
@@ -239,6 +266,7 @@ struct LightUniforms {
 @group(2) @binding(0) var<uniform> light: LightUniforms;
 @group(2) @binding(1) var lightDepth: texture_2d<f32>;
 @group(2) @binding(2) var lightThickness: texture_2d<f32>;
+@group(2) @binding(3) var causticTex: texture_2d<f32>;
 
 fn qRotateVec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
   let qv = q.xyz;
@@ -288,6 +316,31 @@ fn computeShadow(worldPos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
   let tinted = mix(vec3<f32>(1.0), occluderColor, shadowAmt);
   let backfaceMask = smoothstep(0.0, 0.20, nDotL);
   return mix(vec3<f32>(1.0), max(tinted, vec3<f32>(0.35)), backfaceMask);
+}
+
+fn computeCaustics(worldPos: vec3<f32>, worldNormal: vec3<f32>) -> f32 {
+  if (worldNormal.y < 0.1) { return 1.0; }
+
+  let lp = light.viewProj * vec4<f32>(worldPos, 1.0);
+  let w = max(abs(lp.w), 1e-6);
+  let ndc = lp.xyz / w;
+  if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) {
+    return 1.0;
+  }
+
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let dims = vec2<f32>(textureDimensions(causticTex));
+  let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+
+  let sample2 = textureLoad(causticTex, px, 0);
+  let fluidDepth = sample2.g;
+  if (fluidDepth >= 1e5) { return 1.0; }
+
+  let lv = light.view * vec4<f32>(worldPos, 1.0);
+  let recZ = -lv.z;
+  if (recZ < fluidDepth - 0.15) { return 1.0; }
+
+  return sample2.r;
 }
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -443,10 +496,11 @@ fn terrain_fs(input: VOut) -> @location(0) vec4<f32> {
   let sunCol = vec3<f32>(1.02, 0.98, 0.92);
 
   let shadow = computeShadow(input.worldPos, n);
+  let caustic = computeCaustics(input.worldPos, n);
 
   let ambientTerm = vec3<f32>(0.30, 0.34, 0.42);
   let directTerm = vec3<f32>(halfLambert) * sunCol * 1.65;
-  var lit = albedo * (ambientTerm + directTerm * shadow);
+  var lit = albedo * (ambientTerm + directTerm * shadow * caustic);
 
   let depth = clamp(-input.localPos.y * 0.10, 0.0, 1.0);
   lit = mix(lit, lit * vec3<f32>(0.72, 0.66, 0.56), depth * 0.40);
@@ -551,6 +605,7 @@ export class SceneRenderer {
   public setLightMaps(
     depthView: GPUTextureView,
     thicknessView: GPUTextureView,
+    causticView: GPUTextureView,
   ): void {
     if (!this.lightUniform) return;
     this.lightBindGroup = this.device.createBindGroup({
@@ -559,6 +614,7 @@ export class SceneRenderer {
         { binding: 0, resource: { buffer: this.lightUniform } },
         { binding: 1, resource: depthView },
         { binding: 2, resource: thicknessView },
+        { binding: 3, resource: causticView },
       ],
     });
   }
@@ -670,6 +726,11 @@ export class SceneRenderer {
         },
         {
           binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" },
+        },
+        {
+          binding: 3,
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" },
         },

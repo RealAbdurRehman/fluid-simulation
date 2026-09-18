@@ -38,7 +38,7 @@ struct SimParams {
   terrainMeta: vec4<f32>,
   gridInfo: vec4<u32>,
   gridInfo2: vec4<f32>,
-  foamParams: vec4<f32>, // x: generationRate, y: decayRate, z: minSpeed, w: maxSpeed
+  foamParams: vec4<f32>,
 };
 
 struct ProbeSample {
@@ -611,12 +611,10 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
             let viscDamping = min(viscWeight * viscScale, 0.40) * invDt;
             viscosityForce += (neighborVel - vel) * viscDamping;
 
-            // --- trapped-air potential (foam) ---
             let velDiff = vel - neighborVel;
             let velDiffLen = length(velDiff);
             if (velDiffLen > 1e-4) {
               let velDiffDir = velDiff / velDiffLen;
-              // xij_hat points from the neighbor toward this particle, which is -dir
               let align = clamp(1.0 - dot(velDiffDir, -dir), 0.0, 2.0);
               trappedAir += vVisc * vVisc * align * velDiffLen;
             }
@@ -639,7 +637,6 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let wallAccel = containerRepulsionForce(pos, params.particleRadius);
   particles[index].velocity = vec4<f32>(vel + (totalAcceleration + wallAccel) * params.deltaTime, 0.0);
 
-  // --- foam: gate trapped-air potential by speed and free-surface proximity, decay, store ---
   let speed = length(vel);
   let kinetic = smoothstep(params.foamParams.z, params.foamParams.w, speed);
   let surfaceExposure = clamp(1.0 - density / max(targetDensity, 0.0001), 0.0, 1.0);

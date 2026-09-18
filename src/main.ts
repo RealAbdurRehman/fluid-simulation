@@ -34,6 +34,7 @@ async function bootstrap(): Promise<void> {
   sceneRenderer.setLightMaps(
     ssfr.getLightDepthView(),
     ssfr.getLightThicknessView(),
+    ssfr.getCausticsView(),
   );
 
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
@@ -217,6 +218,12 @@ async function bootstrap(): Promise<void> {
         },
       });
       ssfr.encodeLightDepth(pass, config.numParticles);
+      pass.end();
+    }
+
+    {
+      const pass = encoder.beginComputePass();
+      ssfr.encodeCaustics(pass);
       pass.end();
     }
 

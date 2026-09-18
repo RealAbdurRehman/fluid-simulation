@@ -202,7 +202,7 @@ export class FluidSimulationGPU {
     );
 
     this.simParamsBuffer = this.createBuffer(
-      192,
+      224,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       "simParams",
     );
@@ -641,7 +641,7 @@ export class FluidSimulationGPU {
     const r6 = Math.pow(r, 6);
     const r9 = Math.pow(r, 9);
 
-    const buffer = new ArrayBuffer(192);
+    const buffer = new ArrayBuffer(224);
     const f32 = new Float32Array(buffer);
     const u32 = new Uint32Array(buffer);
 

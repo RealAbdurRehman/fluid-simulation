@@ -117,6 +117,11 @@ export const config = {
   foamThreshold: 0.25,
   foamSoftness: 0.35,
 
+  causticsEnabled: true,
+  causticsIntensity: 1.6,
+  causticsScale: 0.3,
+  causticsSpeed: 1.0,
+
   numParticles: 22768,
   maxParticles: 42768,
   particleSize: 0.4,
@@ -186,6 +191,7 @@ export function setupGUI(
   addContainerFolder(gui, onUpdateBounds);
   addSPHFolder(gui);
   addFoamFolder(gui);
+  addCausticsFolder(gui);
   addParticleFolder(gui, onResetParticles, onUpdateParticleSize);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
   addTerrainFolder(gui, onRegenerateTerrain);
@@ -293,6 +299,14 @@ function addFoamFolder(gui: GUI): void {
   folder.add(config, "foamNoiseScale", 1, 15, 0.5).name("Noise Scale");
   folder.add(config, "foamThreshold", 0, 1, 0.02).name("Threshold");
   folder.add(config, "foamSoftness", 0.02, 0.8, 0.02).name("Softness");
+}
+
+function addCausticsFolder(gui: GUI): void {
+  const folder = gui.addFolder("Caustics");
+  folder.add(config, "causticsEnabled").name("Enabled");
+  folder.add(config, "causticsIntensity", 0, 4, 0.05).name("Intensity");
+  folder.add(config, "causticsScale", 0.3, 3, 0.05).name("Pattern Scale");
+  folder.add(config, "causticsSpeed", 0, 3, 0.05).name("Animation Speed");
 }
 
 function addParticleFolder(

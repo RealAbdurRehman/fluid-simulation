@@ -226,6 +226,108 @@ fn fs(in: VOut) -> FOut {
 }
 `;
 
+const causticsWGSL = /* wgsl */ `
+struct CausticParams {
+  time: f32,
+  intensity: f32,
+  patternScale: f32,
+  _pad0: f32,
+};
+
+@group(0) @binding(0) var fluidLightDepth: texture_2d<f32>;
+@group(0) @binding(1) var causticOut: texture_storage_2d<rg32float, write>;
+@group(0) @binding(2) var<uniform> params: CausticParams;
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var q = fract(p * vec2<f32>(127.1, 311.7));
+  q += dot(q, q + 34.23);
+  return fract(q.x * q.y);
+}
+
+fn noise2(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm2(p0: vec2<f32>) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var p = p0;
+  for (var i = 0; i < 3; i = i + 1) {
+    v += a * noise2(p);
+    p = p * 2.07 + vec2<f32>(1.7, 9.2);
+    a *= 0.5;
+  }
+  return v;
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(fluidLightDepth);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  let dC = textureLoad(fluidLightDepth, coord, 0).r;
+
+  if (dC >= 1e5) {
+    textureStore(causticOut, coord, vec4<f32>(1.0, 1e6, 0.0, 0.0));
+    return;
+  }
+
+  let dimsI = vec2<i32>(dims);
+  let maxIdx = dimsI - vec2<i32>(1);
+  let cL = clamp(coord + vec2<i32>(-4, 0), vec2<i32>(0), maxIdx);
+  let cR = clamp(coord + vec2<i32>( 4, 0), vec2<i32>(0), maxIdx);
+  let cU = clamp(coord + vec2<i32>(0, -4), vec2<i32>(0), maxIdx);
+  let cD = clamp(coord + vec2<i32>(0,  4), vec2<i32>(0), maxIdx);
+
+  let dL = textureLoad(fluidLightDepth, cL, 0).r;
+  let dR = textureLoad(fluidLightDepth, cR, 0).r;
+  let dU = textureLoad(fluidLightDepth, cU, 0).r;
+  let dD = textureLoad(fluidLightDepth, cD, 0).r;
+
+  let validL = dL < 1e5;
+  let validR = dR < 1e5;
+  let validU = dU < 1e5;
+  let validD = dD < 1e5;
+
+  let dx = select(0.0, dR - dL, validL && validR);
+  let dy = select(0.0, dD - dU, validU && validD);
+
+  let scale = params.patternScale;
+  let time = params.time;
+
+  let uvBase = vec2<f32>(f32(coord.x), f32(coord.y));
+
+  let warpX = fbm2(uvBase * 0.006 * scale + vec2<f32>(time * 0.21, time * 0.13));
+  let warpY = fbm2(uvBase * 0.006 * scale + vec2<f32>(-time * 0.17, time * 0.29) + vec2<f32>(113.0, 71.0));
+
+  let uvWarp = uvBase * 0.03 * scale + vec2<f32>(warpX, warpY) * 2.5;
+  let depthWarp = vec2<f32>(dx, dy) * 0.35;
+  let warped = uvWarp + depthWarp;
+
+  let n1 = fbm2(warped + vec2<f32>(time * 0.5, 0.0));
+  let n2 = fbm2(warped * 1.17 + vec2<f32>(0.0, time * 0.4) + vec2<f32>(37.0, 19.0));
+
+  let r1 = abs(sin(n1 * 12.566));
+  let r2 = abs(sin(n2 * 12.566));
+  let ridged = 1.0 - min(r1, r2);
+
+  let caustic = pow(ridged, 5.0);
+  let slope = sqrt(dx * dx + dy * dy);
+  let slopeBoost = 1.0 + min(slope * 2.0, 1.5);
+
+  let finalVal = clamp(1.0 + caustic * params.intensity * slopeBoost, 1.0, 3.5);
+  textureStore(causticOut, coord, vec4<f32>(finalVal, dC, 0.0, 0.0));
+}
+`;
+
 const bilateralWGSL = /* wgsl */ `
 struct Params {
   axis: u32,
@@ -308,7 +410,7 @@ struct Uniforms {
   reflHorizon: vec4<f32>,
   params3: vec4<f32>,
   foamParams: vec4<f32>,
-  invView: mat4x4<f32>, 
+  invView: mat4x4<f32>,
 };
 
 struct LightShadowU {
@@ -531,6 +633,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   );
 
   let sceneCol = textureSampleLevel(sceneColor, linSamp, in.uv, 0.0).rgb;
+
   let dC = textureLoad(fluidDepth, fluidCoord, 0).r;
 
   if (dC >= 1e5) {
@@ -594,7 +697,6 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
   let facing = clamp(abs(normalSmooth.z), 0.0, 1.0);
 
- 
   let foamRaw = sampleFoamDilated(fluidCoord, fluidDimsI);
 
   let noiseScale = 2.5;
@@ -604,7 +706,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   let perturb = vec2<f32>(n1 - 0.5, n2 - 0.5) * noiseAmp;
 
   let flatness = smoothstep(0.3, 0.7, dot(normalSmooth, worldUpInView));
- 
+
   let perturbAmt = flatness * edgeFactor * facing;
   var normalShade = normalize(
     normalSmooth + vec3<f32>(perturb.x, perturb.y, 0.0) * perturbAmt,
@@ -738,9 +840,11 @@ export class SSFRRenderer {
   private bilateralHPipeline!: GPUComputePipeline;
   private bilateralVPipeline!: GPUComputePipeline;
   private compositePipeline!: GPURenderPipeline;
+  private causticsPipeline!: GPUComputePipeline;
 
   private particleUniform!: GPUBuffer;
   private lightUniform!: GPUBuffer;
+  private causticsParams!: GPUBuffer;
   private bilateralParamsH!: GPUBuffer;
   private bilateralParamsV!: GPUBuffer;
   private compositeUniform!: GPUBuffer;
@@ -754,6 +858,7 @@ export class SSFRRenderer {
   private bilateralVBind!: GPUBindGroup;
   private compositeBindGroup!: GPUBindGroup;
   private compositeLightBind!: GPUBindGroup;
+  private causticsBind!: GPUBindGroup;
 
   private sceneColorTexture!: GPUTexture;
   private sceneDepthTexture!: GPUTexture;
@@ -767,11 +872,13 @@ export class SSFRRenderer {
   private lightDepthTexture!: GPUTexture;
   private lightThicknessTexture!: GPUTexture;
   private lightDepthStencil!: GPUTexture;
+  private causticsTexture!: GPUTexture;
 
   private linearSampler!: GPUSampler;
 
   private compLayout!: GPUBindGroupLayout;
   private bilatLayout!: GPUBindGroupLayout;
+  private causticsLayout!: GPUBindGroupLayout;
 
   private width = 1;
   private height = 1;
@@ -820,6 +927,11 @@ export class SSFRRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    this.causticsParams = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
     this.bilateralParamsH = this.device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -848,6 +960,9 @@ export class SSFRRenderer {
     });
     const lightDepthMod = this.device.createShaderModule({
       code: lightDepthWGSL,
+    });
+    const causticsMod = this.device.createShaderModule({
+      code: causticsWGSL,
     });
     const bilatMod = this.device.createShaderModule({ code: bilateralWGSL });
     const compMod = this.device.createShaderModule({ code: compositeWGSL });
@@ -954,6 +1069,33 @@ export class SSFRRenderer {
         depthCompare: "less",
       },
       primitive: { topology: "triangle-list" },
+    });
+
+    this.causticsLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          texture: { sampleType: "unfilterable-float" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: { access: "write-only", format: "rg32float" },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
+
+    this.causticsPipeline = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.causticsLayout],
+      }),
+      compute: { module: causticsMod, entryPoint: "main" },
     });
 
     const bilatLayout = this.device.createBindGroupLayout({
@@ -1077,6 +1219,11 @@ export class SSFRRenderer {
       format: "depth24plus",
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
+    this.causticsTexture = this.device.createTexture({
+      size: [LIGHT_MAP_SIZE, LIGHT_MAP_SIZE],
+      format: "rg32float",
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
 
     this.compositeLightBind = this.device.createBindGroup({
       layout: compositeLightLayout,
@@ -1084,6 +1231,15 @@ export class SSFRRenderer {
         { binding: 0, resource: { buffer: this.compositeLightUniform } },
         { binding: 1, resource: this.lightDepthTexture.createView() },
         { binding: 2, resource: this.lightThicknessTexture.createView() },
+      ],
+    });
+
+    this.causticsBind = this.device.createBindGroup({
+      layout: this.causticsLayout,
+      entries: [
+        { binding: 0, resource: this.lightDepthTexture.createView() },
+        { binding: 1, resource: this.causticsTexture.createView() },
+        { binding: 2, resource: { buffer: this.causticsParams } },
       ],
     });
   }
@@ -1199,6 +1355,9 @@ export class SSFRRenderer {
   }
   public getFluidWorldPosView(): GPUTextureView {
     return this.fluidWorldPosTexture.createView();
+  }
+  public getCausticsView(): GPUTextureView {
+    return this.causticsTexture.createView();
   }
   public getLightDepthView(): GPUTextureView {
     return this.lightDepthTexture.createView();
@@ -1327,6 +1486,13 @@ export class SSFRRenderer {
     pu[43] = 0;
     this.device.queue.writeBuffer(this.particleUniform, 0, pu);
 
+    const causticU = new Float32Array(4);
+    causticU[0] = this.time * config.causticsSpeed;
+    causticU[1] = config.causticsEnabled ? config.causticsIntensity : 0.0;
+    causticU[2] = config.causticsScale;
+    causticU[3] = 0;
+    this.device.queue.writeBuffer(this.causticsParams, 0, causticU);
+
     this.updateLightUniform();
 
     const sigmaWorld = splatWorldRadius * 2.0;
@@ -1449,6 +1615,14 @@ export class SSFRRenderer {
     pass.setPipeline(this.thicknessPipeline);
     pass.setBindGroup(0, this.lightThicknessBind);
     pass.draw(6, particleCount, 0, 0);
+  }
+  public encodeCaustics(pass: GPUComputePassEncoder): void {
+    pass.setPipeline(this.causticsPipeline);
+    pass.setBindGroup(0, this.causticsBind);
+    pass.dispatchWorkgroups(
+      Math.ceil(LIGHT_MAP_SIZE / 8),
+      Math.ceil(LIGHT_MAP_SIZE / 8),
+    );
   }
   public encodeBilateralH(pass: GPUComputePassEncoder): void {
     pass.setPipeline(this.bilateralHPipeline);
