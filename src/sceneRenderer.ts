@@ -2,6 +2,11 @@ import * as THREE from "three";
 
 import { acesFilmicWGSL } from "./shader/common.wgsl";
 import { GPUBufferUsage, GPUShaderStage, GPUTextureUsage } from "./types";
+import {
+  createDefaultMaterial,
+  type ModelMaterial,
+  type TextureSource,
+} from "./materials";
 
 const SAMPLE_COUNT = 1;
 const MAX_OBJECT_SLOTS = 16;
@@ -107,14 +112,25 @@ fn computeCaustics(worldPos: vec3<f32>, worldNormal: vec3<f32>) -> f32 {
   return sample2.r;
 }
 
+struct MaterialUniforms {
+  baseColor: vec4<f32>,
+  params: vec4<f32>,   
+};
+
+@group(3) @binding(0) var<uniform> material: MaterialUniforms;
+@group(3) @binding(1) var baseSampler: sampler;
+@group(3) @binding(2) var baseTex: texture_2d<f32>;
+
 struct MeshVIn {
   @location(0) position: vec3<f32>,
   @location(1) normal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
 };
 struct MeshVOut {
   @builtin(position) position: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
   @location(1) worldNormal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
 };
 
 @vertex
@@ -127,11 +143,17 @@ fn mesh_vs(input: MeshVIn) -> MeshVOut {
   out.position = frame.viewProj * vec4<f32>(world, 1.0);
   out.worldPos = world;
   out.worldNormal = rotatedNormal;
+  out.uv = input.uv;
   return out;
 }
 
 @fragment
 fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
+  
+  let texel = textureSample(baseTex, baseSampler, input.uv);
+  let tint = mix(vec3<f32>(1.0), obj.color.rgb, material.params.x);
+  let albedo = tint * material.baseColor.rgb * texel.rgb;
+
   let n = normalize(input.worldNormal);
   let lightDir = normalize(vec3<f32>(0.45, 1.0, 0.35));
   let ndl = max(dot(n, lightDir), 0.0);
@@ -141,9 +163,9 @@ fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
   let caustic = computeCaustics(input.worldPos, n);
 
   let ambient = vec3<f32>(0.30, 0.36, 0.44);
-  let direct = obj.color.rgb * (ndl * 0.95) * shadow * caustic;
+  let direct = albedo * (ndl * 0.95) * shadow * caustic;
 
-  var lit = obj.color.rgb * ambient + direct;
+  var lit = albedo * ambient + direct;
 
   let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.55;
   lit += vec3<f32>(0.35, 0.65, 1.0) * rim;
@@ -525,19 +547,27 @@ export interface ObjectVisual {
 
 const MESH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
   {
-    arrayStride: 24,
+    arrayStride: 32,
     stepMode: "vertex",
     attributes: [
       { shaderLocation: 0, offset: 0, format: "float32x3" },
       { shaderLocation: 1, offset: 12, format: "float32x3" },
+      { shaderLocation: 2, offset: 24, format: "float32x2" },
     ],
   },
 ];
+
+interface RegisteredSubmesh {
+  indexStart: number;
+  indexCount: number;
+  materialBindGroup: GPUBindGroup;
+}
 
 interface RegisteredMesh {
   vertex: GPUBuffer;
   index: GPUBuffer;
   indexCount: number;
+  submeshes: RegisteredSubmesh[];
 }
 
 export class SceneRenderer {
@@ -569,6 +599,12 @@ export class SceneRenderer {
   private lightObjectFrameBind!: GPUBindGroup;
 
   private meshRegistry = new Map<string, RegisteredMesh>();
+
+  private materialLayout!: GPUBindGroupLayout;
+  private whiteTexture!: GPUTexture;
+  private defaultMaterialBindGroup!: GPUBindGroup;
+  private textureCache = new Map<TextureSource, GPUTexture>();
+  private materialCache = new Map<ModelMaterial, GPUBindGroup>();
 
   private depthTexture!: GPUTexture;
   private msaaTexture!: GPUTexture;
@@ -624,6 +660,7 @@ export class SceneRenderer {
     absorb: [number, number, number],
   ): void {
     if (!this.lightUniform) return;
+
     const data = new Float32Array(36);
     data.set(viewProj, 0);
     data.set(view, 16);
@@ -631,24 +668,32 @@ export class SceneRenderer {
     data[33] = absorb[1];
     data[34] = absorb[2];
     data[35] = 0;
+
     this.device.queue.writeBuffer(this.lightUniform, 0, data);
   }
-  public registerMesh(name: string, geometry: THREE.BufferGeometry): void {
+  public registerMesh(
+    name: string,
+    geometry: THREE.BufferGeometry,
+    materials: ModelMaterial[] = [],
+  ): void {
     if (this.meshRegistry.has(name)) return;
     if (!geometry.attributes.normal) geometry.computeVertexNormals();
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const normAttr = geometry.attributes.normal as THREE.BufferAttribute;
+    const uvAttr = geometry.attributes.uv as THREE.BufferAttribute | undefined;
     const count = posAttr.count;
 
-    const data = new Float32Array(count * 6);
+    const data = new Float32Array(count * 8);
     for (let i = 0; i < count; i++) {
-      data[i * 6 + 0] = posAttr.getX(i);
-      data[i * 6 + 1] = posAttr.getY(i);
-      data[i * 6 + 2] = posAttr.getZ(i);
-      data[i * 6 + 3] = normAttr.getX(i);
-      data[i * 6 + 4] = normAttr.getY(i);
-      data[i * 6 + 5] = normAttr.getZ(i);
+      data[i * 8 + 0] = posAttr.getX(i);
+      data[i * 8 + 1] = posAttr.getY(i);
+      data[i * 8 + 2] = posAttr.getZ(i);
+      data[i * 8 + 3] = normAttr.getX(i);
+      data[i * 8 + 4] = normAttr.getY(i);
+      data[i * 8 + 5] = normAttr.getZ(i);
+      data[i * 8 + 6] = uvAttr ? uvAttr.getX(i) : 0;
+      data[i * 8 + 7] = uvAttr ? uvAttr.getY(i) : 0;
     }
 
     const vertexBuf = this.device.createBuffer({
@@ -672,11 +717,146 @@ export class SceneRenderer {
     });
     this.device.queue.writeBuffer(indexBuf, 0, indexData);
 
+    const groups =
+      geometry.groups.length > 0
+        ? geometry.groups
+        : [{ start: 0, count: indexData.length, materialIndex: 0 }];
+
+    const submeshes: RegisteredSubmesh[] = [];
+    for (const g of groups) {
+      const indexCount = Math.min(g.count, indexData.length - g.start);
+      if (indexCount <= 0) continue;
+
+      const mat = materials[g.materialIndex ?? 0];
+      submeshes.push({
+        indexStart: g.start,
+        indexCount,
+        materialBindGroup: mat
+          ? this.getMaterialBindGroup(mat)
+          : this.defaultMaterialBindGroup,
+      });
+    }
+
     this.meshRegistry.set(name, {
       vertex: vertexBuf,
       index: indexBuf,
       indexCount: indexData.length,
+      submeshes,
     });
+  }
+  private getMaterialBindGroup(mat: ModelMaterial): GPUBindGroup {
+    const cached = this.materialCache.get(mat);
+    if (cached) return cached;
+
+    const tex = mat.map ? this.getTexture(mat.map) : null;
+
+    const uniform = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      uniform,
+      0,
+      new Float32Array([
+        mat.color[0],
+        mat.color[1],
+        mat.color[2],
+        1,
+        mat.tintWithObjectColor ? 1 : 0,
+        0,
+        0,
+        0,
+      ]),
+    );
+
+    const sampler = this.device.createSampler({
+      addressModeU: mat.wrapS,
+      addressModeV: mat.wrapT,
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+      maxAnisotropy: 8,
+    });
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.materialLayout,
+      entries: [
+        { binding: 0, resource: { buffer: uniform } },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: (tex ?? this.whiteTexture).createView() },
+      ],
+    });
+
+    this.materialCache.set(mat, bindGroup);
+    return bindGroup;
+  }
+  private getTexture(src: TextureSource): GPUTexture | null {
+    const cached = this.textureCache.get(src);
+    if (cached) return cached;
+
+    const anySrc = src as any;
+    const w: number = anySrc.naturalWidth || anySrc.width || 0;
+    const h: number = anySrc.naturalHeight || anySrc.height || 0;
+    const maxDim = this.device.limits.maxTextureDimension2D;
+    if (!w || !h || w > maxDim || h > maxDim) {
+      console.warn(`Skipping texture with unsupported size ${w}x${h}`);
+      return null;
+    }
+
+    try {
+      const mipCount = Math.floor(Math.log2(Math.max(w, h))) + 1;
+      const texture = this.device.createTexture({
+        size: [w, h],
+        format: "rgba8unorm",
+        mipLevelCount: mipCount,
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+
+      this.device.queue.copyExternalImageToTexture(
+        { source: src },
+        { texture, mipLevel: 0 },
+        [w, h],
+      );
+
+      let prev: CanvasImageSource = src;
+      let mw = w;
+      let mh = h;
+      for (let level = 1; level < mipCount; level++) {
+        mw = Math.max(1, mw >> 1);
+        mh = Math.max(1, mh >> 1);
+
+        const canvas: HTMLCanvasElement | OffscreenCanvas =
+          typeof OffscreenCanvas !== "undefined"
+            ? new OffscreenCanvas(mw, mh)
+            : Object.assign(document.createElement("canvas"), {
+                width: mw,
+                height: mh,
+              });
+        const ctx = canvas.getContext("2d") as
+          | CanvasRenderingContext2D
+          | OffscreenCanvasRenderingContext2D
+          | null;
+        if (!ctx) break;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(prev, 0, 0, mw, mh);
+
+        this.device.queue.copyExternalImageToTexture(
+          { source: canvas },
+          { texture, mipLevel: level },
+          [mw, mh],
+        );
+        prev = canvas;
+      }
+
+      this.textureCache.set(src, texture);
+      return texture;
+    } catch (err) {
+      console.warn("Failed to upload model texture:", err);
+      return null;
+    }
   }
   private createPipelines(): void {
     const mod = this.device.createShaderModule({ code: sceneShaderWGSL });
@@ -748,8 +928,48 @@ export class SceneRenderer {
       ],
     });
 
+    this.materialLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          sampler: { type: "filtering" },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "float" },
+        },
+      ],
+    });
+
+    this.whiteTexture = this.device.createTexture({
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture(
+      { texture: this.whiteTexture },
+      new Uint8Array([255, 255, 255, 255]),
+      { bytesPerRow: 4 },
+      [1, 1],
+    );
+    this.defaultMaterialBindGroup = this.getMaterialBindGroup(
+      createDefaultMaterial(),
+    );
+
     const layout = this.device.createPipelineLayout({
-      bindGroupLayouts: [frameLayout, objectLayout, lightLayout],
+      bindGroupLayouts: [
+        frameLayout,
+        objectLayout,
+        lightLayout,
+        this.materialLayout,
+      ],
     });
 
     this.frameUniform = this.device.createBuffer({
@@ -1088,7 +1308,10 @@ export class SceneRenderer {
       if (this.lightBindGroup) pass.setBindGroup(2, this.lightBindGroup);
       pass.setVertexBuffer(0, mesh.vertex);
       pass.setIndexBuffer(mesh.index, "uint32");
-      pass.drawIndexed(mesh.indexCount);
+      for (const sm of mesh.submeshes) {
+        pass.setBindGroup(3, sm.materialBindGroup);
+        pass.drawIndexed(sm.indexCount, 1, sm.indexStart);
+      }
     }
   }
 }

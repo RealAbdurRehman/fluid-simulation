@@ -39,7 +39,7 @@ export class MeshRegistry {
       const model = await loadModel(def);
       this.loaded.set(id, model);
       this.geometries.set(id, model.geometry);
-      this.sceneRenderer.registerMesh(id, model.geometry);
+      this.sceneRenderer.registerMesh(id, model.geometry, model.materials);
 
       this.simulation
         .bakeMesh(model.geometry, MESH_BAKE_RESOLUTION, MESH_BAKE_PADDING)
