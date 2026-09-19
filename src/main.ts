@@ -129,6 +129,7 @@ async function bootstrap(): Promise<void> {
   const FIXED_DELTA = 1 / 60;
   const MAX_STEPS_PER_FRAME = 2;
   let accumulator = 0;
+  let simTime = 0;
 
   function animate(timestamp: number): void {
     timer.update(timestamp);
@@ -151,6 +152,7 @@ async function bootstrap(): Promise<void> {
       updaters.updateObjects(FIXED_DELTA);
       simulation.recordStepCommands(encoder, FIXED_DELTA);
     } else if (!config.paused) {
+      simTime += frameDelta;
       let steps = 0;
       while (accumulator >= FIXED_DELTA && steps < MAX_STEPS_PER_FRAME) {
         accumulator -= FIXED_DELTA;
@@ -164,7 +166,7 @@ async function bootstrap(): Promise<void> {
       accumulator = 0;
     }
 
-    ssfr.time = timer.getElapsed();
+    ssfr.time = simTime;
 
     const aspect = canvas.width / canvas.height;
     const tanHalfFovY = Math.tan((camera.fov * Math.PI) / 360);
