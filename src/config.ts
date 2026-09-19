@@ -149,8 +149,8 @@ export const config = {
   specularIntensity: 0.6,
   specColor: new THREE.Color(1.0, 0.98, 0.92),
   foamColor: new THREE.Color(0.93, 0.96, 0.99),
-  reflSky: new THREE.Color(0.42, 0.55, 0.68),
-  reflHorizon: new THREE.Color(0.14, 0.24, 0.34),
+  reflSky: new THREE.Color(0.1, 0.22, 0.45),
+  reflHorizon: new THREE.Color(0.55, 0.68, 0.82),
   lightAbsorb: new THREE.Color(0.85, 0.45, 0.28),
 
   depthMixCoeff: 0.22,

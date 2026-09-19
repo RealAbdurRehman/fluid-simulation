@@ -114,7 +114,7 @@ fn computeCaustics(worldPos: vec3<f32>, worldNormal: vec3<f32>) -> f32 {
 
 struct MaterialUniforms {
   baseColor: vec4<f32>,
-  params: vec4<f32>,   
+  params: vec4<f32>,
 };
 
 @group(3) @binding(0) var<uniform> material: MaterialUniforms;
@@ -149,7 +149,6 @@ fn mesh_vs(input: MeshVIn) -> MeshVOut {
 
 @fragment
 fn mesh_fs(input: MeshVOut) -> @location(0) vec4<f32> {
-  
   let texel = textureSample(baseTex, baseSampler, input.uv);
   let tint = mix(vec3<f32>(1.0), obj.color.rgb, material.params.x);
   let albedo = tint * material.baseColor.rgb * texel.rgb;
@@ -230,36 +229,109 @@ fn light_fs(in: VOut) -> @location(0) vec4<f32> {
 
 const skyShaderWGSL = /* wgsl */ `
 struct SkyUniforms {
+  invViewProj: mat4x4<f32>,
+  sunDir: vec4<f32>,
+  sunColor: vec4<f32>,
   topColor: vec4<f32>,
   horizonColor: vec4<f32>,
   bottomColor: vec4<f32>,
-  resolution: vec4<f32>,
+  params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> sky: SkyUniforms;
 
-@vertex
-fn sky_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-  var pos = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>( 3.0, -1.0),
-    vec2<f32>(-1.0,  3.0)
-  );
-  return vec4<f32>(pos[vi], 1.0, 1.0);
-}
-
 ${acesFilmicWGSL}
 
-@fragment
-fn sky_fs(@builtin(position) fragPos: vec4<f32>) -> @location(0) vec4<f32> {
-  let t = clamp(fragPos.y / sky.resolution.y, 0.0, 1.0);
-  var c: vec3<f32>;
-  if (t < 0.5) {
-    c = mix(sky.topColor.rgb, sky.horizonColor.rgb, t * 2.0);
-  } else {
-    c = mix(sky.horizonColor.rgb, sky.bottomColor.rgb, (t - 0.5) * 2.0);
+struct SkyVOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn sky_vs(@builtin(vertex_index) vi: u32) -> SkyVOut {
+  var p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0),
+  );
+  var out: SkyVOut;
+  out.pos = vec4<f32>(p[vi], 1.0, 1.0);
+  out.uv = p[vi] * 0.5 + 0.5;
+  return out;
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var q = fract(p * vec2<f32>(127.1, 311.7));
+  q += dot(q, q + 34.23);
+  return fract(q.x * q.y);
+}
+
+fn noise2(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm2(p0: vec2<f32>) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var p = p0;
+  for (var i = 0; i < 5; i = i + 1) {
+    v += a * noise2(p);
+    p = p * 2.07 + vec2<f32>(1.7, 9.2);
+    a *= 0.5;
   }
-  return vec4<f32>(acesFilmic(c * 1.3), 1.0);
+  return v;
+}
+
+@fragment
+fn sky_fs(in: SkyVOut) -> @location(0) vec4<f32> {
+  let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
+  let nW = sky.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
+  let fW = sky.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
+  let dir = normalize(fW.xyz / fW.w - nW.xyz / nW.w);
+  let up = dir.y;
+
+  var col: vec3<f32>;
+  if (up > 0.0) {
+    let t = pow(clamp(up, 0.0, 1.0), 0.55);
+    col = mix(sky.horizonColor.rgb, sky.topColor.rgb, t);
+  } else {
+    let t = pow(clamp(-up, 0.0, 1.0), 0.55);
+    col = mix(sky.horizonColor.rgb, sky.bottomColor.rgb, t);
+  }
+
+  let sunDot = max(dot(dir, sky.sunDir.xyz), 0.0);
+  let sunDisk = smoothstep(0.9997, 0.99995, sunDot);
+  let sunGlow = pow(sunDot, 128.0) * 0.5 + pow(sunDot, 12.0) * 0.10;
+  col += sky.sunColor.rgb * (sunDisk * 20.0 + sunGlow);
+
+  let haze = exp(-abs(up) * 6.0) * 0.5;
+  let hazeCol = mix(sky.horizonColor.rgb, sky.sunColor.rgb, pow(sunDot, 3.0) * 0.7);
+  col = mix(col, hazeCol, haze * 0.35);
+
+  if (up > 0.01) {
+    let plane = dir.xz / max(dir.y, 0.08) * 0.5;
+    let t = sky.params.x;
+    let p = plane + vec2<f32>(t * 0.006, t * 0.003);
+    let base = fbm2(p * 0.55);
+    let detail = fbm2(p * 1.90 + vec2<f32>(11.0, 5.0));
+    let shape = base * 0.75 + detail * 0.25;
+    let cov = sky.params.y;
+    var cloud = smoothstep(cov, cov + 0.22, shape);
+    cloud = cloud * smoothstep(0.0, 0.25, up);
+    let lit = 0.55 + 0.45 * sunDot;
+    let cloudCol = mix(sky.horizonColor.rgb * 0.9, vec3<f32>(1.0, 0.98, 0.94), lit);
+    col = mix(col, cloudCol, cloud * 0.85);
+  }
+
+  col *= 1.0 - clamp(-up, 0.0, 1.0) * 0.35;
+  return vec4<f32>(acesFilmic(col * sky.params.z), 1.0);
 }
 `;
 
@@ -1018,7 +1090,7 @@ export class SceneRenderer {
     });
 
     this.skyUniform = this.device.createBuffer({
-      size: 64,
+      size: 160,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -1148,26 +1220,6 @@ export class SceneRenderer {
       sampleCount: SAMPLE_COUNT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
-
-    const sky = new Float32Array([
-      0.015,
-      0.025,
-      0.055,
-      1,
-      0.045,
-      0.075,
-      0.12,
-      1,
-      0.09,
-      0.11,
-      0.15,
-      1,
-      this.depthWidth,
-      this.depthHeight,
-      0,
-      0,
-    ]);
-    this.device.queue.writeBuffer(this.skyUniform, 0, sky);
   }
   public getDepthView(): GPUTextureView {
     return this.depthTexture.createView();
@@ -1185,6 +1237,38 @@ export class SceneRenderer {
     data[17] = cameraPos[1];
     data[18] = cameraPos[2];
     this.device.queue.writeBuffer(this.frameUniform, 0, data);
+
+    const sunLen = Math.hypot(0.45, 1.0, 0.35);
+    const invVP = new THREE.Matrix4().fromArray(viewProjMatrix).invert();
+
+    const sky = new Float32Array(40);
+    sky.set(invVP.elements, 0);
+    sky[16] = 0.45 / sunLen;
+    sky[17] = 1.0 / sunLen;
+    sky[18] = 0.35 / sunLen;
+    sky[19] = 0.0;
+    sky[20] = 1.0;
+    sky[21] = 0.96;
+    sky[22] = 0.86;
+    sky[23] = 0.0;
+    sky[24] = 0.1;
+    sky[25] = 0.22;
+    sky[26] = 0.45;
+    sky[27] = 1.0;
+    sky[28] = 0.55;
+    sky[29] = 0.68;
+    sky[30] = 0.82;
+    sky[31] = 1.0;
+    sky[32] = 0.18;
+    sky[33] = 0.2;
+    sky[34] = 0.22;
+    sky[35] = 1.0;
+    sky[36] = this.time;
+    sky[37] = 0.55;
+    sky[38] = 1.15;
+    sky[39] = 0.0;
+
+    this.device.queue.writeBuffer(this.skyUniform, 0, sky);
   }
   private writeObject(
     slot: number,
