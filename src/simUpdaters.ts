@@ -55,6 +55,10 @@ const PAIR_RESTITUTION = 0.2;
 const PAIR_FRICTION = 0.85;
 
 const TERRAIN_CONTACT_EPS = 0.5;
+
+// Bodies keep a wall-sized gap from the sides and ceiling (so fluid can pass), but the
+// floor is handled by the terrain, so the container floor only needs a hairline gap.
+const FLOOR_CLEARANCE = 0.02;
 const PAIR_ITERATIONS = 3;
 
 const _hullTmp = new THREE.Vector3();
@@ -569,7 +573,8 @@ function createObjectsUpdater(
 
     const wallClearance = config.particleSize * 3.0;
     const hx = config.boundsWidth / 2 - wallClearance;
-    const hy = config.boundsHeight / 2 - wallClearance;
+    const hyTop = config.boundsHeight / 2 - wallClearance;
+    const hyBottom = config.boundsHeight / 2 - FLOOR_CLEARANCE;
     const hz = config.boundsDepth / 2 - wallClearance;
 
     const size = slot.size;
@@ -606,11 +611,11 @@ function createObjectsUpdater(
       _localVel.x *= -config.collisionDamping;
     }
 
-    if (_localPos.y + minY < -hy) {
-      _localPos.y = -hy - minY;
+    if (_localPos.y + minY < -hyBottom) {
+      _localPos.y = -hyBottom - minY;
       _localVel.y *= -config.collisionDamping;
-    } else if (_localPos.y + maxY > hy) {
-      _localPos.y = hy - maxY;
+    } else if (_localPos.y + maxY > hyTop) {
+      _localPos.y = hyTop - maxY;
       _localVel.y *= -config.collisionDamping;
     }
 
