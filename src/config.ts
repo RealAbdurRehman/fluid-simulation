@@ -1,7 +1,7 @@
 import * as THREE from "three";
 
 import GUI from "lil-gui";
-import { MODEL_IDS } from "./models";
+import { MODEL_DEFAULTS, MODEL_IDS } from "./models";
 
 export interface SimulationPreset {
   name: string;
@@ -67,6 +67,7 @@ export interface ObjectSlotConfig {
   densityRatio: number;
   drag: number;
   angularDrag: number;
+  wobbleDamping: number;
 }
 
 function makeObjectSlot(
@@ -84,6 +85,7 @@ function makeObjectSlot(
     densityRatio: 0.5,
     drag: 8.0,
     angularDrag: 4.0,
+    wobbleDamping: 0.0,
     ...overrides,
   };
 }
@@ -345,14 +347,41 @@ function addObjectFolders(
 
   config.objects.forEach((slot, index) => {
     const folder = gui.addFolder(`Object ${index + 1}`);
-    folder
-      .add(slot, "modelId", modelOptions)
-      .name("Model")
-      .onChange(() => onObjectChanged(index));
+
+    const modelCtrl = folder.add(slot, "modelId", modelOptions).name("Model");
+
     folder.add(slot, "size", minSize, maxSize, 0.05).name("Size");
-    folder
-      .add(slot, "densityRatio", 0.05, 4.0, 0.05)
+
+    const densityCtrl = folder
+      .add(slot, "densityRatio", 0.1, 4.0, 0.05)
       .name("Density (rel. fluid)");
+
+    const dragCtrl = folder.add(slot, "drag", 0.0, 40.0, 0.5).name("Drag");
+
+    const angDragCtrl = folder
+      .add(slot, "angularDrag", 0.0, 20.0, 0.1)
+      .name("Angular Drag");
+
+    const wobbleCtrl = folder
+      .add(slot, "wobbleDamping", 0.0, 30.0, 0.5)
+      .name("Wobble Damping");
+
+    modelCtrl.onChange(() => {
+      const defaults = MODEL_DEFAULTS[slot.modelId];
+      if (defaults) {
+        slot.densityRatio = defaults.densityRatio;
+        slot.drag = defaults.drag;
+        slot.angularDrag = defaults.angularDrag;
+        slot.wobbleDamping = defaults.wobbleDamping ?? 0.0;
+        densityCtrl.updateDisplay();
+        dragCtrl.updateDisplay();
+        angDragCtrl.updateDisplay();
+        wobbleCtrl.updateDisplay();
+      }
+
+      onObjectChanged(index);
+    });
+
     folder.add({ spawn: () => onSpawnObject(index) }, "spawn").name("Spawn");
   });
 }

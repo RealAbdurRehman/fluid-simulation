@@ -16,6 +16,8 @@ export class RigidBody {
   quaternion = new THREE.Quaternion();
   linearVelocity = new THREE.Vector3();
   angularVelocity = new THREE.Vector3();
+  cobArm = new THREE.Vector3();
+  angVelSlow = new THREE.Vector3();
 
   mass: number;
   volume: number;

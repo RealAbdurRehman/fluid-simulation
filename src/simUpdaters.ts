@@ -35,10 +35,17 @@ const MAX_ANGULAR_SPEED = 4.0;
 const AIR_LINEAR_DAMPING = 0.4;
 const AIR_ANGULAR_DAMPING = 1.2;
 
-const WATER_ANGULAR_DAMPING = 20.0;
-const BUOYANCY_TORQUE_CAP = 0.4;
-const RIGHTING_STRENGTH = 0.12;
-const RIGHTING_DAMPING = 0.6;
+const BUOYANCY_TORQUE_CAP = 0.25;
+const BUOYANCY_MAX_ARM = 0.5;
+const COB_SMOOTH_TAU = 0.05;
+const HEAVE_ZETA = 0.8;
+
+// Wobble damping only removes rotation faster than ~1/(2*pi*tau) Hz.
+// Larger tau => lower cutoff => more (slower) motion is treated as wobble.
+// Smaller tau => only very fast jitter is damped, waves follow more freely.
+const WOBBLE_TAU = 0.25;
+const RIGHTING_STRENGTH = 0.07;
+const RIGHTING_DAMPING = 0.3;
 
 const PROBE_DENSITY_SCALE = 0.55;
 
@@ -63,6 +70,7 @@ const _tmpVecA = new THREE.Vector3();
 const _tmpVecB = new THREE.Vector3();
 const _tmpVecC = new THREE.Vector3();
 const _tmpVecD = new THREE.Vector3();
+const _torque = new THREE.Vector3();
 
 const colorCache = new Map<string, RGBA>();
 
@@ -425,6 +433,8 @@ function createObjectsUpdater(
     const mEff = body.mass + ADDED_MASS * fluidMass;
     const fs = body.mass / mEff;
 
+    const supportRatio = THREE.MathUtils.clamp(fluidMass / body.mass, 0, 1);
+
     const dragSubmerged = Math.sqrt(submergedFraction);
     const dragFluidMass = localRho * body.volume * dragSubmerged;
 
@@ -449,10 +459,22 @@ function createObjectsUpdater(
 
       body.applyForceWorld(buoyancy, body.position, dt);
 
-      const rSub = _hullTmp.subVectors(centerSub, body.position);
-      const torque = _tmpVecD.crossVectors(rSub, buoyancy);
+      const armBlend = 1 - Math.exp(-dt / COB_SMOOTH_TAU);
+      _hullTmp.subVectors(centerSub, body.position);
+      _hullTmp.y = 0;
+      const maxArm = slot.size * BUOYANCY_MAX_ARM;
+      if (_hullTmp.lengthSq() > maxArm * maxArm) _hullTmp.setLength(maxArm);
+      body.cobArm.lerp(_hullTmp, armBlend);
 
-      const torqueCap = body.mass * g * slot.size * BUOYANCY_TORQUE_CAP;
+      const torqueForce = _tmpVecD.set(
+        0,
+        Math.min(buoyancy.y, body.mass * g * fs),
+        0,
+      );
+      const torque = _torque.crossVectors(body.cobArm, torqueForce);
+
+      const torqueCap =
+        body.mass * Math.abs(g) * slot.size * BUOYANCY_TORQUE_CAP;
       const torqueLen = torque.length();
       if (torqueLen > torqueCap) torque.multiplyScalar(torqueCap / torqueLen);
 
@@ -466,9 +488,23 @@ function createObjectsUpdater(
       const dragForce = relVel.multiplyScalar(-slot.drag * dragFluidMass * fs);
       body.applyForceWorld(dragForce, body.position, dt);
 
-      body.angularVelocity.multiplyScalar(
-        Math.max(0, 1 - WATER_ANGULAR_DAMPING * submergedFraction * dt),
+      const omegaHeave = Math.sqrt(
+        Math.abs(g) / (Math.max(body.densityRatio, 0.05) * slot.size),
       );
+      const heaveRate = 2 * HEAVE_ZETA * omegaHeave * supportRatio;
+      const vyRel = body.linearVelocity.y - avgFluidVel.y;
+      body.linearVelocity.y -=
+        vyRel * ((heaveRate * dt) / (1 + heaveRate * dt));
+
+      body.angularVelocity.multiplyScalar(
+        Math.max(0, 1 - body.angularDrag * supportRatio * dt),
+      );
+
+      const wobbleBlend = 1 - Math.exp(-dt / WOBBLE_TAU);
+      body.angVelSlow.lerp(body.angularVelocity, wobbleBlend);
+      const wobbleKill = 1 - Math.exp(-slot.wobbleDamping * supportRatio * dt);
+      _hullTmp.subVectors(body.angularVelocity, body.angVelSlow);
+      body.angularVelocity.addScaledVector(_hullTmp, -wobbleKill);
 
       const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(
         body.quaternion,
@@ -480,15 +516,16 @@ function createObjectsUpdater(
       if (sinAngle > 1e-4) {
         axis.divideScalar(sinAngle);
         const angle = Math.asin(Math.min(sinAngle, 1.0));
-        const kp =
-          submergedFraction * body.mass * g * RIGHTING_STRENGTH * slot.size;
-        const kd =
-          submergedFraction * body.mass * g * RIGHTING_DAMPING * slot.size;
+        const kp = supportRatio * body.mass * g * RIGHTING_STRENGTH * slot.size;
+        const kd = supportRatio * body.mass * g * RIGHTING_DAMPING * slot.size;
         const angVelAlong = body.angularVelocity.dot(axis);
         const mag = angle * kp - angVelAlong * kd;
         axis.multiplyScalar(mag);
         body.applyTorqueWorld(axis, dt);
       }
+    } else {
+      body.cobArm.multiplyScalar(Math.exp(-dt / COB_SMOOTH_TAU));
+      body.angVelSlow.copy(body.angularVelocity);
     }
 
     const linSpeed = body.linearVelocity.length();
