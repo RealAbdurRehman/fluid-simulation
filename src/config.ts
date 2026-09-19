@@ -1,7 +1,13 @@
 import * as THREE from "three";
 
-import GUI from "lil-gui";
-import { MODEL_DEFAULTS, MODEL_IDS } from "./models";
+import GUI, { type Controller } from "lil-gui";
+import {
+  DEFAULT_MODEL_DEFAULTS,
+  MODELS,
+  MODEL_DEFAULTS,
+  registerModel,
+  type ModelDef,
+} from "./models";
 
 export interface SimulationPreset {
   name: string;
@@ -89,6 +95,8 @@ function makeObjectSlot(
     ...overrides,
   };
 }
+
+const modelIdControllers: Controller[] = [];
 
 export const config = {
   preset: "Standard Water",
@@ -215,6 +223,7 @@ export function setupGUI(
   addInteractionFolder(gui);
   addSceneFolder(gui, onUpdateBounds, onRegenerateTerrain);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
+  addCustomModelFolder(gui);
 
   return gui;
 }
@@ -340,7 +349,7 @@ function addObjectFolders(
   onObjectChanged: (index: number) => void,
   onSpawnObject: (index: number) => void,
 ): void {
-  const modelOptions = ["none", ...MODEL_IDS];
+  const modelOptions = ["none", ...Object.keys(MODELS)];
   const maxSize =
     Math.min(config.boundsWidth, config.boundsHeight, config.boundsDepth) * 0.2;
   const minSize = Math.max(config.particleSize * 2.0, 0.5);
@@ -349,6 +358,7 @@ function addObjectFolders(
     const folder = gui.addFolder(`Object ${index + 1}`);
 
     const modelCtrl = folder.add(slot, "modelId", modelOptions).name("Model");
+    modelIdControllers.push(modelCtrl);
 
     folder.add(slot, "size", minSize, maxSize, 0.05).name("Size");
 
@@ -367,21 +377,63 @@ function addObjectFolders(
       .name("Wobble Damping");
 
     modelCtrl.onChange(() => {
-      const defaults = MODEL_DEFAULTS[slot.modelId];
-      if (defaults) {
-        slot.densityRatio = defaults.densityRatio;
-        slot.drag = defaults.drag;
-        slot.angularDrag = defaults.angularDrag;
-        slot.wobbleDamping = defaults.wobbleDamping ?? 0.0;
-        densityCtrl.updateDisplay();
-        dragCtrl.updateDisplay();
-        angDragCtrl.updateDisplay();
-        wobbleCtrl.updateDisplay();
-      }
+      const defaults = MODEL_DEFAULTS[slot.modelId] ?? DEFAULT_MODEL_DEFAULTS;
+      slot.densityRatio = defaults.densityRatio;
+      slot.drag = defaults.drag;
+      slot.angularDrag = defaults.angularDrag;
+      slot.wobbleDamping = defaults.wobbleDamping ?? 0.0;
+      densityCtrl.updateDisplay();
+      dragCtrl.updateDisplay();
+      angDragCtrl.updateDisplay();
+      wobbleCtrl.updateDisplay();
 
       onObjectChanged(index);
     });
 
     folder.add({ spawn: () => onSpawnObject(index) }, "spawn").name("Spawn");
   });
+}
+
+function addCustomModelFolder(gui: GUI): void {
+  const folder = gui.addFolder("Custom Models (Only .glb)");
+  let counter = 0;
+
+  folder
+    .add(
+      {
+        load: () => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".glb";
+          input.onchange = () => {
+            const file = input.files?.[0];
+            if (!file) return;
+
+            const base = file.name
+              .replace(/\.[^.]+$/, "")
+              .replace(/[^a-zA-Z0-9_]/g, "_");
+            const id = `user_${base}_${counter++}`;
+            const def: ModelDef = {
+              id,
+              label: file.name,
+              url: URL.createObjectURL(file),
+            };
+
+            registerModel(def);
+            refreshModelOptions();
+          };
+          input.click();
+        },
+      },
+      "load",
+    )
+    .name("Load");
+}
+
+function refreshModelOptions(): void {
+  const options = ["none", ...Object.keys(MODELS)];
+  for (const c of modelIdControllers) {
+    c.options(options);
+    c.updateDisplay();
+  }
 }

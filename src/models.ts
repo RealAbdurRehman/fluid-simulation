@@ -52,3 +52,14 @@ export const MODEL_DEFAULTS: Record<string, ModelDefaults> = {
   rock: { densityRatio: 2.2, drag: 10.0, angularDrag: 6.0 },
   crate: { densityRatio: 0.4, drag: 7.0, angularDrag: 4.0 },
 };
+
+export const DEFAULT_MODEL_DEFAULTS: ModelDefaults = {
+  densityRatio: 0.5,
+  drag: 8.0,
+  angularDrag: 4.0,
+  wobbleDamping: 0.0,
+};
+
+export function registerModel(def: ModelDef): void {
+  MODELS[def.id] = def;
+}
