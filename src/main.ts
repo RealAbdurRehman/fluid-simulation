@@ -10,6 +10,7 @@ import { createSimUpdaters } from "./simUpdaters";
 import { generateTerrain, terrainToGeometry } from "./terrain";
 import { AudioEngine } from "./audio/audioEngine";
 import { FluidStatsGPU } from "./audio/fluidStats";
+import { SplashDetector } from "./audio/splashDetector";
 import { SimAudio } from "./audio/audio";
 
 async function bootstrap(): Promise<void> {
@@ -43,11 +44,15 @@ async function bootstrap(): Promise<void> {
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
   meshRegistry.preloadAll();
 
-  // ---- audio ----------------------------------------------------------------
   const audioEngine = new AudioEngine();
   const audio = new SimAudio(audioEngine);
   const fluidStats = new FluidStatsGPU(device, simulation.getParticlesBuffer());
-  audioEngine.armAutoResume(); // browsers require a click/key before sound plays
+  const splashDetector = new SplashDetector(
+    device,
+    simulation.getParticlesBuffer(),
+  );
+
+  audioEngine.armAutoResume();
   void audioEngine.load().then(() => audio.initBeds());
 
   const updaters = createSimUpdaters(
@@ -155,6 +160,7 @@ async function bootstrap(): Promise<void> {
 
     simulation.pollProbeResults();
     fluidStats.poll();
+    splashDetector.poll();
 
     controls.update();
     camera.updateMatrixWorld();
@@ -180,12 +186,20 @@ async function bootstrap(): Promise<void> {
         steps++;
       }
       if (steps === MAX_STEPS_PER_FRAME) accumulator = 0;
-    } else {
-      accumulator = 0;
-    }
+    } else accumulator = 0;
 
     if (!config.paused && config.audio.enabled)
       fluidStats.record(encoder, config.numParticles, config.targetDensity);
+
+    if (!config.paused && config.numParticles > 0)
+      splashDetector.record(
+        encoder,
+        config.numParticles,
+        config.boundsWidth,
+        config.boundsHeight,
+        config.boundsDepth,
+        config.targetDensity,
+      );
 
     ssfr.time = simTime;
 
@@ -373,6 +387,7 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
+    audio.feedSplashes(splashDetector.drain(), frameDelta);
     audio.update(frameDelta, {
       camera,
       paused: config.paused,

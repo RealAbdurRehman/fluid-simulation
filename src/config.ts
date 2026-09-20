@@ -179,7 +179,7 @@ export const config = {
 
   audio: {
     enabled: true,
-    master: 0.8,
+    master: 0.4,
     ambience: 0.9,
     effects: 1.0,
     underwaterCutoff: 650,

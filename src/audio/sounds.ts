@@ -10,7 +10,14 @@ export const SOUND_FILES = {
   bubbles: "bubbles.mp3",
   rumble: "rumble.mp3",
   underwater: "under-water.mp3",
-
+  splashWater1: "splash-water1.mp3",
+  splashWater2: "splash-water2.mp3",
+  splashWater3: "splash-water3.mp3",
+  splashWater4: "splash-water4.mp3",
+  splashWater5: "splash-water5.mp3",
+  splashWater6: "splash-water6.mp3",
+  splashWater7: "splash-water7.mp3",
+  splashWater8: "splash-water8.mp3",
   splashSmall: "splash-small.mp3",
   splashMedium: "splash-medium.mp3",
   splashLarge: "splash-large.mp3",
@@ -34,3 +41,14 @@ export const SPLASH_TIERS: SoundId[] = [
 export const DRIP_IDS: SoundId[] = ["drip1", "drip2", "drip3"];
 
 export const THUD_IDS: SoundId[] = ["thud1", "thud2", "thud3"];
+
+export const WATER_SPLASH_IDS: SoundId[] = [
+  "splashWater1",
+  "splashWater2",
+  "splashWater3",
+  "splashWater4",
+  "splashWater5",
+  "splashWater6",
+  "splashWater7",
+  "splashWater8",
+];

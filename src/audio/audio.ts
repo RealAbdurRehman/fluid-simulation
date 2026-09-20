@@ -2,6 +2,7 @@ import * as THREE from "three";
 
 import { config, type ObjectSlotConfig } from "../config";
 import type { RigidBody } from "../rigidBody";
+
 import {
   AudioEngine,
   clampToOne,
@@ -12,8 +13,18 @@ import {
   type CrossfadeLoop,
   type PositionalBus,
 } from "./audioEngine";
+
 import type { FluidStats } from "./fluidStats";
-import { DRIP_IDS, SPLASH_TIERS, THUD_IDS, type SoundId } from "./sounds";
+
+import {
+  DRIP_IDS,
+  SPLASH_TIERS,
+  THUD_IDS,
+  WATER_SPLASH_IDS,
+  type SoundId,
+} from "./sounds";
+
+import type { SplashEvent } from "./splashDetector";
 
 interface BodyRef {
   index: number;
@@ -109,6 +120,12 @@ export class SimAudio implements SimAudioHooks {
   private sSurface = 0;
   private sSpray = 0;
   private dripAcc = 0;
+
+  private sprayBaseline = 0;
+  private foamBaseline = 0;
+  private surfaceBaseline = 0;
+
+  private splashCooldown = 0;
 
   private uw = 0;
   private camUnder = false;
@@ -296,6 +313,41 @@ export class SimAudio implements SimAudioHooks {
   public onInteractionStart(): void {
     this.engine.play("whoosh", { gain: 0.35, rate: rand(0.9, 1.1) });
   }
+  public feedSplashes(events: SplashEvent[], dt: number): void {
+    this.splashCooldown -= dt;
+
+    if (this.splashCooldown > 0) return;
+    if (this.uw > 0.7) return;
+    if (!this.engine.canPlay) return;
+    if (events.length === 0) return;
+
+    let energy = 0;
+    let count = 0;
+    const pos = new THREE.Vector3();
+    for (const ev of events) {
+      const total = energy + ev.energy;
+      const w = total > 0 ? ev.energy / total : 0.5;
+      pos.lerp(new THREE.Vector3(ev.x, ev.y, ev.z), w);
+      energy = total;
+      count += ev.count;
+    }
+
+    const k = clampToOne(Math.sqrt(energy) / 18);
+    const gain = (0.22 + 0.68 * Math.pow(k, 0.75)) * (1 - 0.55 * this.uw);
+    if (gain < 0.03) return;
+
+    const id = this.engine.pickVariant("waterSplash", WATER_SPLASH_IDS);
+    const sizeN = clampToOne(k);
+
+    this.engine.play(id, {
+      gain,
+      rate: rand(0.9, 1.1) * lerp(1.15, 0.85, sizeN),
+      position: pos,
+    });
+
+    this.splashCooldown = 0.2 + Math.random() * 0.1;
+    this.globalPulse = Math.max(this.globalPulse, k * 0.4);
+  }
   public update(dt: number, f: AudioFrame): void {
     const e = this.engine;
     const a = config.audio;
@@ -347,6 +399,24 @@ export class SimAudio implements SimAudioHooks {
       this.sSpray = smoothAsym(this.sSpray, s.sprayCount, dt, 0.1, 0.4);
     }
 
+    const invCount = 1 / Math.max(f.particleCount, 1);
+    const sprayNorm = s ? this.sSpray * invCount : 0;
+
+    this.sprayBaseline = smoothAsym(
+      this.sprayBaseline,
+      sprayNorm,
+      dt,
+      1.0,
+      3.0,
+    );
+    this.foamBaseline = smoothAsym(this.foamBaseline, this.sFoam, dt, 1.0, 3.0);
+    this.surfaceBaseline = smoothAsym(
+      this.surfaceBaseline,
+      this.sSurface,
+      dt,
+      1.0,
+      3.0,
+    );
     const flowF = smoothstep(a.flowMinSpeed, a.flowMaxSpeed, this.sSpeed);
     const foamG = smoothstep(a.foamMin, a.foamMax, this.sFoam);
     const lapG =
@@ -379,7 +449,7 @@ export class SimAudio implements SimAudioHooks {
         0.3,
         0.5,
       );
-      b.foam?.setTarget(foamG * 0.85 * air, 0.15, 0.4);
+      b.foam?.setTarget(foamG * 0.35 * air, 0.35, 0.6);
       b.lapping?.setTarget(
         lapG * 0.7 * smoothstep(0.02, 0.1, s?.surfaceFraction ?? 0) * air,
         0.3,
