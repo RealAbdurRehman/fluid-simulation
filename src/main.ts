@@ -185,7 +185,9 @@ async function bootstrap(): Promise<void> {
         simulation.recordStepCommands(encoder, FIXED_DELTA);
         steps++;
       }
-      if (steps === MAX_STEPS_PER_FRAME) accumulator = 0;
+
+      const maxBacklog = FIXED_DELTA * (MAX_STEPS_PER_FRAME - 1);
+      if (accumulator > maxBacklog) accumulator = maxBacklog;
     } else accumulator = 0;
 
     if (!config.paused && config.audio.enabled)
