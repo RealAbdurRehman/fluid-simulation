@@ -10,7 +10,6 @@ import {
 } from "./models";
 
 export interface SimulationPreset {
-  name: string;
   gravity: number;
   collisionDamping: number;
   targetDensity: number;
@@ -24,7 +23,6 @@ export interface SimulationPreset {
 
 export const PRESETS: Record<string, SimulationPreset> = {
   "Standard Water": {
-    name: "Water",
     gravity: 16.0,
     collisionDamping: 0,
     targetDensity: 6.0,
@@ -36,7 +34,6 @@ export const PRESETS: Record<string, SimulationPreset> = {
     substeps: 1,
   },
   "Slimey Liquid": {
-    name: "Slimey Liquid",
     gravity: 9.81,
     collisionDamping: 0,
     targetDensity: 8.0,
@@ -48,7 +45,6 @@ export const PRESETS: Record<string, SimulationPreset> = {
     substeps: 1,
   },
   "Zero-G Fluid Bubble": {
-    name: "Zero-G Fluid Bubble",
     gravity: 0.0,
     collisionDamping: 0,
     targetDensity: 5.5,
@@ -111,7 +107,6 @@ export const config = {
   smoothingRadius: 0.95,
   viscosityStrength: 0.4,
   particleSpacing: 0.05,
-  xsphStrength: 0.15,
 
   numParticles: 22768,
   maxParticles: 42768,
@@ -318,19 +313,7 @@ function addAudioFolder(gui: GUI): void {
   folder.add(a, "master", 0, 1, 0.01).name("Master");
   folder.add(a, "ambience", 0, 1.5, 0.01).name("Ambience");
   folder.add(a, "effects", 0, 1.5, 0.01).name("Effects");
-  folder
-    .add(a, "underwaterCutoff", 200, 4000, 10)
-    .name("Underwater Cutoff (Hz)");
-
-  const tuning = folder.addFolder("Tuning");
-  tuning.add(a, "flowMinSpeed", 0, 3, 0.05).name("Flow Min Speed");
-  tuning.add(a, "flowMaxSpeed", 0.5, 12, 0.1).name("Flow Max Speed");
-  tuning.add(a, "foamMin", 0, 0.1, 0.005).name("Foam Min");
-  tuning.add(a, "foamMax", 0.02, 0.5, 0.005).name("Foam Max");
-  tuning.add(a, "minImpactSpeed", 0.2, 5, 0.1).name("Min Impact Speed");
-  tuning.add(a, "splashEnergyRef", 5, 3000, 5).name("Splash Energy Ref");
-  tuning.add(a, "impactEnergyRef", 5, 3000, 5).name("Impact Energy Ref");
-  tuning.close();
+  folder.add(a, "underwaterCutoff", 200, 4000, 10).name("Underwater Muffle");
 }
 
 function addSceneFolder(
