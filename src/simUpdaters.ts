@@ -6,6 +6,7 @@ import type { SceneRenderer, ObjectVisual } from "./sceneRenderer";
 import type { MeshRegistry } from "./meshRegistry";
 import type { LoadedModel } from "./modelLoader";
 import type { TerrainData } from "./terrain";
+import type { SimAudioHooks } from "./audio/audio";
 import { RigidBody } from "./rigidBody";
 
 type RGBA = [number, number, number, number];
@@ -84,16 +85,26 @@ export interface SimUpdaters {
   requestBakeForSlot(index: number): void;
   spawnObject(index: number): void;
   setTerrain(data: TerrainData | null, baseY: number): void;
+  /** Camera/listener position; sampled as an extra fluid probe (for "underwater" audio). */
+  setListenerPosition(p: THREE.Vector3): void;
+  /** 0..1 fluid density at the listener, or null until probe data arrives. */
+  getListenerSubmersion(): number | null;
 }
 
 export function createSimUpdaters(
   simulation: FluidSimulationGPU,
   sceneRenderer: SceneRenderer,
   meshRegistry: MeshRegistry,
+  audioHooks?: SimAudioHooks,
 ): SimUpdaters {
   return {
     ...createBoundsUpdater(simulation, sceneRenderer),
-    ...createObjectsUpdater(simulation, sceneRenderer, meshRegistry),
+    ...createObjectsUpdater(
+      simulation,
+      sceneRenderer,
+      meshRegistry,
+      audioHooks,
+    ),
   };
 }
 
@@ -183,6 +194,7 @@ function createObjectsUpdater(
   simulation: FluidSimulationGPU,
   sceneRenderer: SceneRenderer,
   meshRegistry: MeshRegistry,
+  hooks?: SimAudioHooks,
 ) {
   const slotCount = config.objects.length;
 
@@ -197,6 +209,11 @@ function createObjectsUpdater(
 
   const probePositions = new Float32Array(1024 * 4);
   let probeCount = 0;
+
+  // Extra probe appended after all object probes: samples fluid at the camera.
+  const listenerPos = new THREE.Vector3();
+  let listenerProbeEnabled = false;
+  let listenerProbeIndex = -1;
 
   let terrainData: TerrainData | null = null;
   let terrainBaseY = 0;
@@ -439,6 +456,10 @@ function createObjectsUpdater(
 
     const supportRatio = THREE.MathUtils.clamp(fluidMass / body.mass, 0, 1);
 
+    body.submergedFraction = submergedFraction;
+    body.supportRatio = supportRatio;
+    body.fluidVelocity.set(0, 0, 0);
+
     const dragSubmerged = Math.sqrt(submergedFraction);
     const dragFluidMass = localRho * body.volume * dragSubmerged;
 
@@ -458,6 +479,7 @@ function createObjectsUpdater(
     if (hasData && submergedFraction > 1e-3 && submergedSum > 1e-6) {
       centerSub.divideScalar(submergedSum);
       avgFluidVel.divideScalar(submergedSum);
+      body.fluidVelocity.copy(avgFluidVel);
 
       const buoyancy = _tmpVecC.set(0, fluidMass * g * fs, 0);
 
@@ -559,6 +581,7 @@ function createObjectsUpdater(
   }
 
   function clampToBounds(
+    index: number,
     body: RigidBody,
     slot: ObjectSlotConfig,
     hullPoints: Float32Array,
@@ -603,32 +626,43 @@ function createObjectsUpdater(
       if (_hullTmp.z > maxZ) maxZ = _hullTmp.z;
     }
 
+    // speed INTO the wall, measured before the bounce/damping is applied
+    let wallHit = 0;
+
     if (_localPos.x + minX < -hx) {
+      wallHit = Math.max(wallHit, -_localVel.x);
       _localPos.x = -hx - minX;
       _localVel.x *= -config.collisionDamping;
     } else if (_localPos.x + maxX > hx) {
+      wallHit = Math.max(wallHit, _localVel.x);
       _localPos.x = hx - maxX;
       _localVel.x *= -config.collisionDamping;
     }
 
     if (_localPos.y + minY < -hyBottom) {
+      wallHit = Math.max(wallHit, -_localVel.y);
       _localPos.y = -hyBottom - minY;
       _localVel.y *= -config.collisionDamping;
     } else if (_localPos.y + maxY > hyTop) {
+      wallHit = Math.max(wallHit, _localVel.y);
       _localPos.y = hyTop - maxY;
       _localVel.y *= -config.collisionDamping;
     }
 
     if (_localPos.z + minZ < -hz) {
+      wallHit = Math.max(wallHit, -_localVel.z);
       _localPos.z = -hz - minZ;
       _localVel.z *= -config.collisionDamping;
     } else if (_localPos.z + maxZ > hz) {
+      wallHit = Math.max(wallHit, _localVel.z);
       _localPos.z = hz - maxZ;
       _localVel.z *= -config.collisionDamping;
     }
 
     body.position.copy(_localPos).applyQuaternion(containerQuat);
     body.linearVelocity.copy(_localVel).applyQuaternion(containerQuat);
+
+    if (wallHit > 0) hooks?.onWallImpact(index, body, slot, wallHit);
   }
 
   function resolveBodyTerrain(entry: ActiveBody): void {
@@ -714,6 +748,8 @@ function createObjectsUpdater(
     const vn = _localVel.x * ux + _localVel.y * uy + _localVel.z * uz;
 
     if (vn < 0) {
+      hooks?.onTerrainImpact(entry.index, body, slot, -vn);
+
       const vTx = _localVel.x - ux * vn;
       const vTy = _localVel.y - uy * vn;
       const vTz = _localVel.z - uz * vn;
@@ -804,6 +840,8 @@ function createObjectsUpdater(
           const vn = _relVel.dot(_pairAxis);
           if (vn > 0) continue;
 
+          if (iteration === 0) hooks?.onPairImpact(A, B, -vn);
+
           const jImp = (-(1 + PAIR_RESTITUTION) * vn) / totalInvM;
 
           A.body.linearVelocity.addScaledVector(_pairAxis, -jImp * invMA);
@@ -824,6 +862,7 @@ function createObjectsUpdater(
   }
 
   function updateObjects(dt: number): void {
+    hooks?.onStepBegin(dt);
     probeCount = 0;
     active.length = 0;
 
@@ -900,9 +939,11 @@ function createObjectsUpdater(
         placedProbes,
       );
 
+      hooks?.onBodyUpdate(i, body, slot, dt);
+
       body.integrate(dt);
 
-      clampToBounds(body, slot, hulls[i]!, hullCounts[i]);
+      clampToBounds(i, body, slot, hulls[i]!, hullCounts[i]);
 
       active.push({
         index: i,
@@ -930,15 +971,44 @@ function createObjectsUpdater(
       else requestBakeForSlot(entry.index);
     }
 
+    if (listenerProbeEnabled && probeCount < 1024) {
+      listenerProbeIndex = probeCount;
+      const o = probeCount * 4;
+      probePositions[o + 0] = listenerPos.x;
+      probePositions[o + 1] = listenerPos.y;
+      probePositions[o + 2] = listenerPos.z;
+      probePositions[o + 3] = 0;
+      probeCount++;
+    } else {
+      listenerProbeIndex = -1;
+    }
+
     simulation.setProbes(probePositions, probeCount);
     simulation.setObjects(descriptors);
     sceneRenderer.setObjectVisuals(visuals);
+  }
+
+  function setListenerPosition(p: THREE.Vector3): void {
+    listenerPos.copy(p);
+    listenerProbeEnabled = true;
+  }
+
+  function getListenerSubmersion(): number | null {
+    if (listenerProbeIndex < 0) return null;
+    const results = simulation.getLatestProbes();
+    if (!results) return null;
+    const o = listenerProbeIndex * 4;
+    if (o + 3 >= results.length) return null;
+    const fullRho = Math.max(config.targetDensity, 1e-4) * PROBE_DENSITY_SCALE;
+    return THREE.MathUtils.clamp(results[o] / fullRho, 0, 1);
   }
 
   return {
     updateObjects,
     requestBakeForSlot,
     setTerrain,
+    setListenerPosition,
+    getListenerSubmersion,
     spawnObject: (index: number) => spawnBody(index, null),
   };
 }

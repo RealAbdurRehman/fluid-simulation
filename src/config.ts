@@ -177,6 +177,23 @@ export const config = {
   interactionRadius: 5.0,
   interactionStrength: 80.0,
 
+  audio: {
+    enabled: true,
+    master: 0.8,
+    ambience: 0.9,
+    effects: 1.0,
+    underwaterCutoff: 650,
+
+    flowMinSpeed: 0.25,
+    flowMaxSpeed: 6.0,
+    foamMin: 0.01,
+    foamMax: 0.12,
+
+    minImpactSpeed: 1.2,
+    splashEnergyRef: 300,
+    impactEnergyRef: 200,
+  },
+
   objects: [
     makeObjectSlot({
       modelId: "sphere",
@@ -221,6 +238,7 @@ export function setupGUI(
   addFluidFolder(gui, onResetParticles, onUpdateParticleSize);
   addPhysicsFolder(gui);
   addInteractionFolder(gui);
+  addAudioFolder(gui);
   addSceneFolder(gui, onUpdateBounds, onRegenerateTerrain);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
   addCustomModelFolder(gui);
@@ -291,6 +309,28 @@ function addInteractionFolder(gui: GUI): void {
   const folder = gui.addFolder("Interaction");
   folder.add(config, "interactionRadius", 1, 15, 0.5).name("Mouse Radius");
   folder.add(config, "interactionStrength", 5, 300, 5).name("Mouse Strength");
+}
+
+function addAudioFolder(gui: GUI): void {
+  const a = config.audio;
+  const folder = gui.addFolder("Audio");
+  folder.add(a, "enabled").name("Enabled");
+  folder.add(a, "master", 0, 1, 0.01).name("Master");
+  folder.add(a, "ambience", 0, 1.5, 0.01).name("Ambience");
+  folder.add(a, "effects", 0, 1.5, 0.01).name("Effects");
+  folder
+    .add(a, "underwaterCutoff", 200, 4000, 10)
+    .name("Underwater Cutoff (Hz)");
+
+  const tuning = folder.addFolder("Tuning");
+  tuning.add(a, "flowMinSpeed", 0, 3, 0.05).name("Flow Min Speed");
+  tuning.add(a, "flowMaxSpeed", 0.5, 12, 0.1).name("Flow Max Speed");
+  tuning.add(a, "foamMin", 0, 0.1, 0.005).name("Foam Min");
+  tuning.add(a, "foamMax", 0.02, 0.5, 0.005).name("Foam Max");
+  tuning.add(a, "minImpactSpeed", 0.2, 5, 0.1).name("Min Impact Speed");
+  tuning.add(a, "splashEnergyRef", 5, 3000, 5).name("Splash Energy Ref");
+  tuning.add(a, "impactEnergyRef", 5, 3000, 5).name("Impact Energy Ref");
+  tuning.close();
 }
 
 function addSceneFolder(

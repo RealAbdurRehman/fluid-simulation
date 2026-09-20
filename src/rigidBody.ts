@@ -19,6 +19,11 @@ export class RigidBody {
   cobArm = new THREE.Vector3();
   angVelSlow = new THREE.Vector3();
 
+  // Written by applyFluidForces each step; read by the audio layer.
+  submergedFraction = 0;
+  supportRatio = 0;
+  fluidVelocity = new THREE.Vector3();
+
   mass: number;
   volume: number;
   densityRatio: number;

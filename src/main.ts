@@ -8,6 +8,9 @@ import { camera, attachControls, resizeCamera } from "./scene";
 import { MeshRegistry } from "./meshRegistry";
 import { createSimUpdaters } from "./simUpdaters";
 import { generateTerrain, terrainToGeometry } from "./terrain";
+import { AudioEngine } from "./audio/audioEngine";
+import { FluidStatsGPU } from "./audio/fluidStats";
+import { SimAudio } from "./audio/audio";
 
 async function bootstrap(): Promise<void> {
   const simulation = new FluidSimulationGPU();
@@ -40,7 +43,19 @@ async function bootstrap(): Promise<void> {
   const meshRegistry = new MeshRegistry(simulation, sceneRenderer);
   meshRegistry.preloadAll();
 
-  const updaters = createSimUpdaters(simulation, sceneRenderer, meshRegistry);
+  // ---- audio ----------------------------------------------------------------
+  const audioEngine = new AudioEngine();
+  const audio = new SimAudio(audioEngine);
+  const fluidStats = new FluidStatsGPU(device, simulation.getParticlesBuffer());
+  audioEngine.armAutoResume(); // browsers require a click/key before sound plays
+  void audioEngine.load().then(() => audio.initBeds());
+
+  const updaters = createSimUpdaters(
+    simulation,
+    sceneRenderer,
+    meshRegistry,
+    audio,
+  );
 
   let terrainMeshCounter = 0;
 
@@ -99,6 +114,7 @@ async function bootstrap(): Promise<void> {
     camera,
     controls,
     simulation,
+    audio,
   });
 
   function resize(): void {
@@ -138,10 +154,12 @@ async function bootstrap(): Promise<void> {
     accumulator += frameDelta;
 
     simulation.pollProbeResults();
+    fluidStats.poll();
 
     controls.update();
     camera.updateMatrixWorld();
     viewState.update(camera);
+    updaters.setListenerPosition(camera.position);
 
     const encoder = device.createCommandEncoder();
 
@@ -165,6 +183,9 @@ async function bootstrap(): Promise<void> {
     } else {
       accumulator = 0;
     }
+
+    if (!config.paused && config.audio.enabled)
+      fluidStats.record(encoder, config.numParticles, config.targetDensity);
 
     ssfr.time = simTime;
 
@@ -352,6 +373,14 @@ async function bootstrap(): Promise<void> {
       pass.end();
     }
 
+    audio.update(frameDelta, {
+      camera,
+      paused: config.paused,
+      fluid: fluidStats.latest,
+      listenerSubmersion: updaters.getListenerSubmersion(),
+      particleCount: config.numParticles,
+    });
+
     device.queue.submit([encoder.finish()]);
     requestAnimationFrame(animate);
   }
@@ -438,8 +467,9 @@ function setupInteraction(args: {
   camera: THREE.PerspectiveCamera;
   controls: ReturnType<typeof attachControls>;
   simulation: FluidSimulationGPU;
+  audio: SimAudio;
 }) {
-  const { canvas, camera, controls, simulation } = args;
+  const { canvas, camera, controls, simulation, audio } = args;
 
   const mouse = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
@@ -470,6 +500,7 @@ function setupInteraction(args: {
     controls.enabled = false;
     isInteracting = true;
     mode = nextMode;
+    audio.onInteractionStart();
     updateRay(e);
   }
 
