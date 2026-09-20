@@ -50,9 +50,74 @@ const COMPUTE_ENTRY_POINTS = [
 
 type ComputeEntryPoint = (typeof COMPUTE_ENTRY_POINTS)[number];
 
+function fract(x: number): number {
+  return x - Math.floor(x);
+}
+
+function hash11(p: number): number {
+  let q = fract(p * 0.1031);
+  q = q * (q + 33.33);
+
+  return fract(q * (q + q));
+}
+
+function smoothstep(e0: number, e1: number, x: number): number {
+  const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
+interface GustSample {
+  envelope: number;
+  yaw: number;
+}
+
+function sampleGusts(
+  t: number,
+  slotLen: number,
+  gustDur: number,
+  seed: number,
+): GustSample {
+  const curSlot = Math.floor(t / slotLen);
+  let envelope = 0;
+  let yawAcc = 0;
+  let weight = 0;
+
+  for (let k = -2; k <= 0; k++) {
+    const slot = curSlot + k;
+
+    const roll = hash11(slot * 1.7 + seed);
+    if (roll >= 0.6) continue;
+
+    const startOff = hash11(slot * 3.1 + seed + 11.0) * slotLen;
+    const durJitter = 0.6 + hash11(slot * 5.3 + seed + 23.0) * 0.9;
+    const peak = 0.45 + hash11(slot * 7.7 + seed + 41.0) * 0.9;
+    const d = gustDur * durJitter;
+    const start = slot * slotLen + startOff;
+
+    const u = (t - start) / d;
+    if (u < 0 || u >= 1) continue;
+
+    const attack = smoothstep(0.0, 0.15, u);
+    const release = 1.0 - smoothstep(0.2, 1.0, u);
+    const env = peak * attack * release;
+
+    const jitter =
+      (hash11(slot * 13.1 + seed + 67.0) * 2 - 1) *
+      (hash11(slot * 17.3 + seed + 89.0) * 0.5 + 0.5);
+
+    envelope += env;
+    yawAcc += jitter * env;
+    weight += env;
+  }
+
+  return { envelope, yaw: weight > 1e-4 ? yawAcc / weight : 0 };
+}
+
 export class FluidSimulationGPU {
   private device!: GPUDevice;
   private isInitialized = false;
+
+  private simTime = 0;
 
   private maxPaddedCount = 0;
   private paddedParticlesCount = 0;
@@ -203,7 +268,7 @@ export class FluidSimulationGPU {
     );
 
     this.simParamsBuffer = this.createBuffer(
-      224,
+      256,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       "simParams",
     );
@@ -285,6 +350,8 @@ export class FluidSimulationGPU {
     this.initParticleGrid();
   }
   public initParticleGrid(): void {
+    this.simTime = 0;
+
     const n = config.numParticles;
     const initialData = new Float32Array(this.paddedParticlesCount * 16);
 
@@ -643,6 +710,8 @@ export class FluidSimulationGPU {
   }
 
   public updateUniforms(subDelta: number): void {
+    this.simTime += subDelta;
+
     this.writeColliders();
     this.updateGridConfig();
 
@@ -650,7 +719,7 @@ export class FluidSimulationGPU {
     const r6 = Math.pow(r, 6);
     const r9 = Math.pow(r, 9);
 
-    const buffer = new ArrayBuffer(224);
+    const buffer = new ArrayBuffer(256);
     const f32 = new Float32Array(buffer);
     const u32 = new Uint32Array(buffer);
 
@@ -713,6 +782,51 @@ export class FluidSimulationGPU {
     f32[45] = config.foamDecayRate;
     f32[46] = config.foamMinSpeed;
     f32[47] = config.foamMaxSpeed;
+
+    let windX = 0,
+      windY = 0,
+      windZ = 0,
+      windStrength = 0;
+
+    if (config.windEnabled && config.windStrength > 0) {
+      const gust = sampleGusts(
+        this.simTime,
+        config.windGustInterval,
+        config.windGustDuration,
+        1.0,
+      );
+      const mul = config.windBaseBreeze + gust.envelope;
+
+      if (mul > 1e-4) {
+        const az = THREE.MathUtils.degToRad(config.windDirection);
+        const el = THREE.MathUtils.degToRad(config.windElevation);
+        const cosEl = Math.cos(el);
+
+        const bx = Math.cos(az) * cosEl;
+        const by = Math.sin(el);
+        const bz = Math.sin(az) * cosEl;
+
+        const yaw = gust.yaw * config.windGustJitter;
+        const cosJ = Math.cos(yaw);
+        const sinJ = Math.sin(yaw);
+
+        windX = bx * cosJ - bz * sinJ;
+        windY = by;
+        windZ = bx * sinJ + bz * cosJ;
+
+        windStrength = config.windStrength * mul;
+      }
+    }
+
+    f32[48] = windX;
+    f32[49] = windY;
+    f32[50] = windZ;
+    f32[51] = windStrength;
+
+    f32[52] = this.simTime;
+    f32[53] = config.windTurbulence;
+    f32[54] = 0;
+    f32[55] = 0;
 
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }

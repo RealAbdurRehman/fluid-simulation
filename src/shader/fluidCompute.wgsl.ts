@@ -39,6 +39,8 @@ struct SimParams {
   gridInfo: vec4<u32>,
   gridInfo2: vec4<f32>,
   foamParams: vec4<f32>,
+  windDir:    vec4<f32>,
+  windParams: vec4<f32>,
 };
 
 struct ProbeSample {
@@ -59,6 +61,35 @@ struct ProbeSample {
 @group(0) @binding(8) var<storage, read_write> sortedIndices: array<u32>;
 
 var<workgroup> blockSums: array<u32, 256>;
+
+fn hash33(p: vec3<f32>) -> f32 {
+  var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+  q += dot(q, q.yxz + 33.33);
+
+  return fract((q.x + q.y) * q.z);
+}
+
+fn valueNoise3(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  let c000 = hash33(i);
+  let c100 = hash33(i + vec3<f32>(1.0, 0.0, 0.0));
+  let c010 = hash33(i + vec3<f32>(0.0, 1.0, 0.0));
+  let c110 = hash33(i + vec3<f32>(1.0, 1.0, 0.0));
+  let c001 = hash33(i + vec3<f32>(0.0, 0.0, 1.0));
+  let c101 = hash33(i + vec3<f32>(1.0, 0.0, 1.0));
+  let c011 = hash33(i + vec3<f32>(0.0, 1.0, 1.0));
+  let c111 = hash33(i + vec3<f32>(1.0, 1.0, 1.0));
+
+  let c00 = mix(c000, c100, u.x);
+  let c10 = mix(c010, c110, u.x);
+  let c01 = mix(c001, c101, u.x);
+  let c11 = mix(c011, c111, u.x);
+
+  return mix(mix(c00, c10, u.y), mix(c01, c11, u.y), u.z);
+}
 
 fn qConjugate(q: vec4<f32>) -> vec4<f32> {
   return vec4<f32>(-q.x, -q.y, -q.z, q.w);
@@ -110,6 +141,29 @@ fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
   let pos = particles[index].position.xyz;
 
   vel.y += -params.gravity * params.deltaTime;
+
+  if (params.windDir.w > 0.0001) {
+    let windDir    = params.windDir.xyz;
+    let strength   = params.windDir.w;
+    let t          = params.windParams.x;
+    let turbulence = params.windParams.y;
+
+    var windAccel = windDir * strength;
+
+    if (turbulence > 0.001) {
+      let phase = pos * (0.35 + turbulence * 0.6)
+                + vec3<f32>(t * 0.9, t * 0.7, t * 1.1);
+
+      let tx = valueNoise3(phase) - 0.5;
+      let ty = valueNoise3(phase + vec3<f32>(31.4, 17.2,  9.8)) - 0.5;
+      let tz = valueNoise3(phase + vec3<f32>(11.1,  5.5, 27.3)) - 0.5;
+
+      let turbAmp = turbulence * 0.5;
+      windAccel += vec3<f32>(tx, ty * 0.4, tz) * strength * turbAmp;
+    }
+
+    vel += windAccel * params.deltaTime;
+  }
 
   if (params.interactionStrength != 0.0) {
     let rayOrigin = params.interactionRayOrigin.xyz;

@@ -172,6 +172,28 @@ export const config = {
   interactionRadius: 5.0,
   interactionStrength: 80.0,
 
+  windEnabled: false,
+  windDirection: 45,
+  windStrength: 6.0,
+  windGustiness: 0.55,
+  windTurbulence: 0.4,
+
+  get windElevation(): number {
+    return 0;
+  },
+  get windGustInterval(): number {
+    return 8.0 - this.windGustiness * 7.0;
+  },
+  get windGustDuration(): number {
+    return 0.8 + this.windGustiness * 0.5;
+  },
+  get windGustJitter(): number {
+    return this.windGustiness * 1.3;
+  },
+  get windBaseBreeze(): number {
+    return 0.3 * (1.0 - this.windGustiness);
+  },
+
   audio: {
     enabled: true,
     master: 0.4,
@@ -232,6 +254,7 @@ export function setupGUI(
   addSimulationFolder(gui);
   addFluidFolder(gui, onResetParticles, onUpdateParticleSize);
   addPhysicsFolder(gui);
+  addWindFolder(gui);
   addInteractionFolder(gui);
   addAudioFolder(gui);
   addSceneFolder(gui, onUpdateBounds, onRegenerateTerrain);
@@ -298,6 +321,15 @@ function addFluidFolder(
 function addPhysicsFolder(gui: GUI): void {
   const folder = gui.addFolder("Physics");
   folder.add(config, "viscosityStrength", 0.0, 30.0, 0.1).name("Viscosity");
+}
+
+function addWindFolder(gui: GUI): void {
+  const folder = gui.addFolder("Wind");
+  folder.add(config, "windEnabled").name("Enabled");
+  folder.add(config, "windDirection", 0, 360, 1).name("Direction");
+  folder.add(config, "windStrength", 0, 20, 0.5).name("Strength");
+  folder.add(config, "windGustiness", 0, 1, 0.01).name("Gustiness");
+  folder.add(config, "windTurbulence", 0, 1.5, 0.05).name("Turbulence");
 }
 
 function addInteractionFolder(gui: GUI): void {
