@@ -511,12 +511,33 @@ function setupInteraction(args: {
     );
   }
 
+  const boundsBox = new THREE.Box3();
+  const localRay = new THREE.Ray();
+  const invQuat = new THREE.Quaternion();
+  const rayOriginLocal = new THREE.Vector3();
+  const rayDirLocal = new THREE.Vector3();
+
+  function rayHitsFluidBounds(ray: THREE.Ray): boolean {
+    const hx = config.boundsWidth / 2;
+    const hy = config.boundsHeight / 2;
+    const hz = config.boundsDepth / 2;
+    boundsBox.min.set(-hx, -hy, -hz);
+    boundsBox.max.set(hx, hy, hz);
+
+    invQuat.copy(simulation.getBoundsQuaternion()).invert();
+    rayOriginLocal.copy(ray.origin).applyQuaternion(invQuat);
+    rayDirLocal.copy(ray.direction).applyQuaternion(invQuat);
+    localRay.set(rayOriginLocal, rayDirLocal);
+
+    return localRay.intersectsBox(boundsBox);
+  }
+
   function begin(nextMode: "push" | "pull", e: MouseEvent): void {
     controls.enabled = false;
     isInteracting = true;
     mode = nextMode;
-    audio.onInteractionStart();
     updateRay(e);
+    if (rayHitsFluidBounds(raycaster.ray)) audio.onInteractionStart();
   }
 
   function end(): void {
