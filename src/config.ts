@@ -172,6 +172,22 @@ export const config = {
   interactionRadius: 5.0,
   interactionStrength: 80.0,
 
+  vortexPower: 0.6,
+  vortexLiftNormalized: 0.0,
+
+  get vortexSwirl(): number {
+    return 130.0 * this.vortexPower;
+  },
+  get vortexInward(): number {
+    return 45.0 * this.vortexPower;
+  },
+  get vortexFalloff(): number {
+    return 1.2;
+  },
+  get vortexLift(): number {
+    return this.vortexLiftNormalized * 200.0;
+  },
+
   windEnabled: false,
   windDirection: 45,
   windStrength: 6.0,
@@ -336,6 +352,9 @@ function addInteractionFolder(gui: GUI): void {
   const folder = gui.addFolder("Interaction");
   folder.add(config, "interactionRadius", 1, 15, 0.5).name("Mouse Radius");
   folder.add(config, "interactionStrength", 5, 300, 5).name("Mouse Strength");
+
+  const vortex = folder.addFolder("Vortex");
+  vortex.add(config, "vortexPower", 0, 2, 0.05).name("Power");
 }
 
 function addAudioFolder(gui: GUI): void {

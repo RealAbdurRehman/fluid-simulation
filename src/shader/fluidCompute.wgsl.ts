@@ -35,6 +35,8 @@ struct SimParams {
   viscFactor: f32, numColliders: u32, numProbes: u32, terrainExtentZ: f32,
   interactionRayOrigin: vec4<f32>,
   interactionRayDir: vec4<f32>,
+  interactionExtra: vec4<f32>,
+  vortexFalloff:    vec4<f32>,
   terrainMeta: vec4<f32>,
   gridInfo: vec4<u32>,
   gridInfo2: vec4<f32>,
@@ -172,16 +174,47 @@ fn externalForces(@builtin(global_invocation_id) id: vec3<u32>) {
     let projDist = dot(v, rayDir);
     let closestPointOnRay = rayOrigin + rayDir * max(0.0, projDist);
 
-    let offset = closestPointOnRay - pos;
+    let offset = closestPointOnRay - pos;         
     let distSqr = dot(offset, offset);
     let radiusSqr = params.interactionRadius * params.interactionRadius;
 
     if (distSqr < radiusSqr && distSqr > 0.0001) {
       let dist = sqrt(distSqr);
-      let dir = offset / dist;
+      let dir = offset / dist;                    
       let centerT = 1.0 - (dist / params.interactionRadius);
-      let force = (dir * params.interactionStrength - vel) * (centerT * centerT);
-      vel += force * params.deltaTime;
+
+      if (params.interactionExtra.x < 0.5) {
+        let force = (dir * params.interactionStrength - vel) * (centerT * centerT);
+        vel += force * params.deltaTime;
+      } else {
+        let falloff = max(params.vortexFalloff.x, 0.01);
+        let w = pow(centerT, falloff);
+
+        let swirlRaw = cross(rayDir, dir);
+        let sl = length(swirlRaw);
+        var tHat = vec3<f32>(0.0);
+        if (sl > 1e-4) {
+          tHat = swirlRaw / sl;
+        }
+
+        let VORTEX_SWIRL_SCALE  = 3.0; 
+        let VORTEX_INWARD_SCALE = 0.15;
+        let VORTEX_LIFT_SCALE   = 0.35;
+        let swirlSpeed  = params.interactionExtra.y * VORTEX_SWIRL_SCALE;
+        let inwardSpeed = params.interactionExtra.z * VORTEX_INWARD_SCALE;
+        let axialSpeed  = params.interactionExtra.w * VORTEX_LIFT_SCALE;
+
+        let rFrac = clamp(dist / params.interactionRadius, 0.0, 1.0);
+        let tangentialSpeed = swirlSpeed * rFrac;
+
+        let targetVel = tHat    * tangentialSpeed * w
+                      + dir     * inwardSpeed    * w
+                      + rayDir  * axialSpeed     * w;
+
+        let responsiveness = 10.0;
+        let k = (1.0 - exp(-responsiveness * params.deltaTime)) * w;
+        vel = mix(vel, targetVel, k);
+      }
     }
   }
 

@@ -492,7 +492,43 @@ function setupInteraction(args: {
   const raycaster = new THREE.Raycaster();
 
   let isInteracting = false;
-  let mode: "push" | "pull" | null = null;
+  let mode: "push" | "pull" | "vortex" | null = null;
+
+  const heldKeys = new Set<string>();
+
+  function isTypingTarget(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+  }
+
+  function onKeyDown(e: KeyboardEvent): void {
+    if (isTypingTarget(e.target)) return;
+    heldKeys.add(e.code);
+  }
+
+  function onKeyUp(e: KeyboardEvent): void {
+    heldKeys.delete(e.code);
+  }
+
+  function onBlur(): void {
+    heldKeys.clear();
+  }
+
+  function resolveMouseMode(e: MouseEvent): "push" | "pull" | "vortex" | null {
+    if (e.button === 1) return "pull";
+    if (e.button === 2) return "push";
+
+    if (e.button === 0) {
+      if (e.shiftKey) return "push";
+      if (e.ctrlKey || e.metaKey) return "pull";
+      if (heldKeys.has("KeyV")) return "vortex";
+      return null;
+    }
+
+    return null;
+  }
 
   function updateRay(e: MouseEvent): void {
     const rect = canvas.getBoundingClientRect();
@@ -502,14 +538,19 @@ function setupInteraction(args: {
 
     if (!isInteracting || !mode) return;
 
-    const strength =
-      mode === "push"
-        ? config.interactionStrength
-        : -config.interactionStrength;
+    let strength: number;
+    if (mode === "vortex") strength = config.interactionStrength;
+    else
+      strength =
+        mode === "push"
+          ? config.interactionStrength
+          : -config.interactionStrength;
+
     simulation.setInteraction(
       raycaster.ray.origin,
       raycaster.ray.direction,
       strength,
+      mode,
     );
   }
 
@@ -534,7 +575,7 @@ function setupInteraction(args: {
     return localRay.intersectsBox(boundsBox);
   }
 
-  function begin(nextMode: "push" | "pull", e: MouseEvent): void {
+  function begin(nextMode: "push" | "pull" | "vortex", e: MouseEvent): void {
     controls.enabled = false;
     isInteracting = true;
     mode = nextMode;
@@ -547,16 +588,20 @@ function setupInteraction(args: {
     isInteracting = false;
     mode = null;
     controls.enabled = true;
-    simulation.setInteraction(new THREE.Vector3(), new THREE.Vector3(), 0);
+    simulation.setInteraction(
+      new THREE.Vector3(),
+      new THREE.Vector3(),
+      0,
+      "push",
+    );
   }
 
   function attach(): void {
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     canvas.addEventListener("mousedown", (e) => {
-      if (e.button === 2 || (e.button === 0 && e.shiftKey)) begin("push", e);
-      else if (e.button === 1 || (e.button === 0 && e.ctrlKey))
-        begin("pull", e);
+      const m = resolveMouseMode(e);
+      if (m) begin(m, e);
     });
 
     window.addEventListener("mousemove", (e) => {
@@ -564,6 +609,9 @@ function setupInteraction(args: {
     });
 
     window.addEventListener("mouseup", end);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
   }
 
   return { attach };

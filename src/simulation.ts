@@ -167,6 +167,7 @@ export class FluidSimulationGPU {
   private rayOrigin = new THREE.Vector3();
   private rayDir = new THREE.Vector3();
   private interactionStrength = 0;
+  private interactionMode: "push" | "pull" | "vortex" = "push";
   public async initialize(): Promise<boolean> {
     if (!navigator.gpu) {
       console.error("WebGPU is not supported by your browser/device.");
@@ -432,10 +433,12 @@ export class FluidSimulationGPU {
     rayOrigin: THREE.Vector3,
     rayDir: THREE.Vector3,
     strength: number,
+    mode: "push" | "pull" | "vortex" = "push",
   ): void {
     this.rayOrigin.copy(rayOrigin);
     this.rayDir.copy(rayDir).normalize();
     this.interactionStrength = strength;
+    this.interactionMode = mode;
   }
   public getDevice(): GPUDevice {
     return this.device;
@@ -763,25 +766,35 @@ export class FluidSimulationGPU {
     f32[30] = this.rayDir.z;
     f32[31] = 0.0;
 
-    f32[32] = this.terrainMeta[0];
-    f32[33] = this.terrainMeta[1];
-    f32[34] = this.terrainMeta[2];
-    f32[35] = this.terrainMeta[3];
+    f32[32] = this.interactionMode === "vortex" ? 1.0 : 0.0;
+    f32[33] = config.vortexSwirl;
+    f32[34] = config.vortexInward;
+    f32[35] = config.vortexLift;
 
-    u32[36] = this.gridInfoU32[0];
-    u32[37] = this.gridInfoU32[1];
-    u32[38] = this.gridInfoU32[2];
-    u32[39] = this.gridInfoU32[3];
+    f32[36] = config.vortexFalloff;
+    f32[37] = 0.0;
+    f32[38] = 0.0;
+    f32[39] = 0.0;
 
-    f32[40] = this.gridInfoF32[0];
-    f32[41] = this.gridInfoF32[1];
-    f32[42] = this.gridInfoF32[2];
-    f32[43] = this.gridInfoF32[3];
+    f32[40] = this.terrainMeta[0];
+    f32[41] = this.terrainMeta[1];
+    f32[42] = this.terrainMeta[2];
+    f32[43] = this.terrainMeta[3];
 
-    f32[44] = config.foamEnabled ? config.foamGenerationRate : 0.0;
-    f32[45] = config.foamDecayRate;
-    f32[46] = config.foamMinSpeed;
-    f32[47] = config.foamMaxSpeed;
+    u32[44] = this.gridInfoU32[0];
+    u32[45] = this.gridInfoU32[1];
+    u32[46] = this.gridInfoU32[2];
+    u32[47] = this.gridInfoU32[3];
+
+    f32[48] = this.gridInfoF32[0];
+    f32[49] = this.gridInfoF32[1];
+    f32[50] = this.gridInfoF32[2];
+    f32[51] = this.gridInfoF32[3];
+
+    f32[52] = config.foamEnabled ? config.foamGenerationRate : 0.0;
+    f32[53] = config.foamDecayRate;
+    f32[54] = config.foamMinSpeed;
+    f32[55] = config.foamMaxSpeed;
 
     let windX = 0,
       windY = 0,
@@ -818,15 +831,15 @@ export class FluidSimulationGPU {
       }
     }
 
-    f32[48] = windX;
-    f32[49] = windY;
-    f32[50] = windZ;
-    f32[51] = windStrength;
+    f32[56] = windX;
+    f32[57] = windY;
+    f32[58] = windZ;
+    f32[59] = windStrength;
 
-    f32[52] = this.simTime;
-    f32[53] = config.windTurbulence;
-    f32[54] = 0;
-    f32[55] = 0;
+    f32[60] = this.simTime;
+    f32[61] = config.windTurbulence;
+    f32[62] = 0;
+    f32[63] = 0;
 
     this.device.queue.writeBuffer(this.simParamsBuffer, 0, buffer);
   }

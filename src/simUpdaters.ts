@@ -41,14 +41,11 @@ const BUOYANCY_MAX_ARM = 0.5;
 const COB_SMOOTH_TAU = 0.05;
 const HEAVE_ZETA = 0.8;
 
-// Wobble damping only removes rotation faster than ~1/(2*pi*tau) Hz.
-// Larger tau => lower cutoff => more (slower) motion is treated as wobble.
-// Smaller tau => only very fast jitter is damped, waves follow more freely.
 const WOBBLE_TAU = 0.25;
 const RIGHTING_STRENGTH = 0.07;
 const RIGHTING_DAMPING = 0.3;
 
-const PROBE_DENSITY_SCALE = 0.55;
+const PROBE_DENSITY_SCALE = 1.0;
 
 const TERRAIN_RESTITUTION = 0.08;
 const TERRAIN_FRICTION = 0.78;
@@ -57,8 +54,6 @@ const PAIR_FRICTION = 0.85;
 
 const TERRAIN_CONTACT_EPS = 0.5;
 
-// Bodies keep a wall-sized gap from the sides and ceiling (so fluid can pass), but the
-// floor is handled by the terrain, so the container floor only needs a hairline gap.
 const FLOOR_CLEARANCE = 0.02;
 const PAIR_ITERATIONS = 3;
 
@@ -85,9 +80,7 @@ export interface SimUpdaters {
   requestBakeForSlot(index: number): void;
   spawnObject(index: number): void;
   setTerrain(data: TerrainData | null, baseY: number): void;
-  /** Camera/listener position; sampled as an extra fluid probe (for "underwater" audio). */
   setListenerPosition(p: THREE.Vector3): void;
-  /** 0..1 fluid density at the listener, or null until probe data arrives. */
   getListenerSubmersion(): number | null;
 }
 
@@ -210,7 +203,6 @@ function createObjectsUpdater(
   const probePositions = new Float32Array(1024 * 4);
   let probeCount = 0;
 
-  // Extra probe appended after all object probes: samples fluid at the camera.
   const listenerPos = new THREE.Vector3();
   let listenerProbeEnabled = false;
   let listenerProbeIndex = -1;
@@ -510,8 +502,16 @@ function createObjectsUpdater(
         body.linearVelocity,
         avgFluidVel,
       );
+      const speed = relVel.length();
 
-      const dragForce = relVel.multiplyScalar(-slot.drag * dragFluidMass * fs);
+      const dragLinear = slot.drag;
+      const dragQuadratic = slot.drag * 0.15;
+
+      const maxCoeff =
+        (0.8 * body.mass) / Math.max(dragFluidMass * fs * dt, 1e-6);
+      const dragCoeff = Math.min(dragLinear + dragQuadratic * speed, maxCoeff);
+
+      const dragForce = relVel.multiplyScalar(-dragCoeff * dragFluidMass * fs);
       body.applyForceWorld(dragForce, body.position, dt);
 
       const omegaHeave = Math.sqrt(
@@ -626,7 +626,6 @@ function createObjectsUpdater(
       if (_hullTmp.z > maxZ) maxZ = _hullTmp.z;
     }
 
-    // speed INTO the wall, measured before the bounce/damping is applied
     let wallHit = 0;
 
     if (_localPos.x + minX < -hx) {
