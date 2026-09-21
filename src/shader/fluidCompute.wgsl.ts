@@ -357,6 +357,23 @@ fn containerRepulsionForce(pos: vec3<f32>, radius: f32) -> vec3<f32> {
   return qRotateVec(container.rotation, localForce) * params.pressureMultiplier;
 }
 
+fn terrainRepulsionForce(pos: vec3<f32>, radius: f32) -> vec3<f32> {
+  if (params.terrainMeta.w < 0.5) { return vec3<f32>(0.0); }
+
+  let container = colliders[0];
+  let localPos = qRotateVec(qConjugate(container.rotation), pos - container.data0.xyz);
+  let baseY = -params.boundsHeight * 0.5;
+
+  let ts = terrainSample(localPos.x, localPos.z);
+  let n = ts.yzw;
+  let perp = (localPos.y - (baseY + ts.x)) * n.y;
+  let d = max(perp - radius, -radius);       // distance past the contact plane
+  if (d >= radius) { return vec3<f32>(0.0); }
+
+  let localForce = n * ((radius - d) / radius);
+  return qRotateVec(container.rotation, localForce) * params.pressureMultiplier;
+}
+
 fn resolveContainer(posIn: vec3<f32>, velIn: vec3<f32>, collider: Collider, radius: f32) -> CollisionResult {
   let invRot = qConjugate(collider.rotation);
   var localPos = qRotateVec(invRot, posIn - collider.data0.xyz);
@@ -565,6 +582,34 @@ fn terrainHeightAt(x: f32, z: f32) -> f32 {
   return h * hs;
 }
 
+fn terrainSample(x: f32, z: f32) -> vec4<f32> {
+  let N = i32(params.terrainMeta.x);
+  let extX = params.terrainMeta.y;
+  let extZ = params.terrainExtentZ;
+  let hs = params.terrainMeta.z;
+  let cellX = extX / f32(N - 1);
+  let cellZ = extZ / f32(N - 1);
+
+  let u = clamp((x + extX * 0.5) / cellX, 0.0, f32(N - 1));
+  let v = clamp((z + extZ * 0.5) / cellZ, 0.0, f32(N - 1));
+  let i0x = i32(floor(u));
+  let i0y = i32(floor(v));
+  let i1x = min(i0x + 1, N - 1);
+  let i1y = min(i0y + 1, N - 1);
+  let fx = u - f32(i0x);
+  let fy = v - f32(i0y);
+
+  let h00 = terrain[i0x + i0y * N];
+  let h10 = terrain[i1x + i0y * N];
+  let h01 = terrain[i0x + i1y * N];
+  let h11 = terrain[i1x + i1y * N];
+
+  let h = mix(mix(h00, h10, fx), mix(h01, h11, fx), fy) * hs;
+  let dhdx = mix(h10 - h00, h11 - h01, fy) * hs / cellX;
+  let dhdz = mix(h01 - h00, h11 - h10, fx) * hs / cellZ;
+  return vec4<f32>(h, normalize(vec3<f32>(-dhdx, 1.0, -dhdz)));
+}
+
 fn resolveTerrain(
   posIn: vec3<f32>,
   velIn: vec3<f32>,
@@ -573,47 +618,33 @@ fn resolveTerrain(
   var r: CollisionResult;
   r.position = posIn;
   r.velocity = velIn;
+
   if (params.terrainMeta.w < 0.5) { return r; }
 
   let container = colliders[0];
   let invRot = qConjugate(container.rotation);
   var localPos = qRotateVec(invRot, posIn - container.data0.xyz);
-  var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
 
   let baseY = -params.boundsHeight * 0.5;
-  let maxTerrainTop = baseY + params.vortexFalloff.y * params.terrainMeta.z + radius;
-  if (localPos.y >= maxTerrainTop) {
-    return r;
-  }
 
-  let surfY = baseY + terrainHeightAt(localPos.x, localPos.z);
-
-  let extX = params.terrainMeta.y;
-  let extZ = params.terrainExtentZ;
-  let cellX = extX / max(params.terrainMeta.x - 1.0, 1.0);
-  let cellZ = extZ / max(params.terrainMeta.x - 1.0, 1.0);
-  let epsX = max(cellX, 0.01);
-  let epsZ = max(cellZ, 0.01);
-  let dxH = terrainHeightAt(localPos.x + epsX, localPos.z)
-          - terrainHeightAt(localPos.x - epsX, localPos.z);
-  let dzH = terrainHeightAt(localPos.x, localPos.z + epsZ)
-          - terrainHeightAt(localPos.x, localPos.z - epsZ);
-  let n = normalize(vec3<f32>(-dxH * epsZ, 2.0 * epsX * epsZ, -dzH * epsX));
-
+  let ts = terrainSample(localPos.x, localPos.z);
+  let n = ts.yzw;
+  let surfY = baseY + ts.x;
   let signedDist = localPos.y - surfY;
   let perpDist = signedDist * n.y;
-  if (perpDist < radius) {
-    if (signedDist < 0.0) {
-      localPos.y = surfY + radius;
-    } else {
-      localPos += n * (radius - perpDist);
-    }
+  if (perpDist >= radius) { return r; }
 
-    let vn = dot(localVel, n);
-    if (vn < 0.0) {
-      let restitution = container.data2.w;
-      localVel -= n * vn * (1.0 + restitution);
-    }
+  var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
+
+  if (perpDist < -radius) {
+    localPos.y = surfY + radius;        
+  } else {
+    localPos += n * (radius - perpDist);
+  }
+
+  let vn = dot(localVel, n);
+  if (vn < 0.0) {
+    localVel -= n * vn * (1.0 + container.data2.w);
   }
 
   r.position = qRotateVec(container.rotation, localPos) + container.data0.xyz;
@@ -734,7 +765,7 @@ fn calculateForces(@builtin(global_invocation_id) id: vec3<u32>) {
     density <= 0.0,
   );
 
-  let wallAccel = containerRepulsionForce(pos, params.particleRadius);
+  let wallAccel = containerRepulsionForce(pos, params.particleRadius) + terrainRepulsionForce(pos, params.particleRadius);
   particles[index].velocity = vec4<f32>(vel + (totalAcceleration + wallAccel) * params.deltaTime, 0.0);
 
   let speed = length(vel);

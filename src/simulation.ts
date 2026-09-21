@@ -707,11 +707,15 @@ export class FluidSimulationGPU {
 
     if (i1 < i0 || j1 < j0) return;
 
-    for (let j = j0; j <= j1; j++)
-      for (let i = i0; i <= i1; i++) {
-        const h = t.heights[j * N + i];
-        if (h > this.terrainMaxH) this.terrainMaxH = h;
-      }
+    const start = (j0 * N + i0) * 4;
+    const end = (j1 * N + i1 + 1) * 4;
+    this.device.queue.writeBuffer(
+      this.terrainBuffer,
+      start,
+      t.heights.buffer,
+      t.heights.byteOffset + start,
+      end - start,
+    );
 
     const colBytes = (i1 - i0 + 1) * 4;
     for (let j = j0; j <= j1; j++) {

@@ -427,17 +427,15 @@ export function patchTerrainMesh(
     for (let i = i0; i <= i1; i++) writeVertex(p, i, j);
 
   const data = p.vertexData;
-  const rowBytes = (i1 - i0 + 1) * VERTEX_BYTES;
-  for (let j = j0; j <= j1; j++) {
-    const startByte = (j * N + i0) * VERTEX_FLOATS * 4;
-    device.queue.writeBuffer(
-      p.vertexBuffer,
-      startByte,
-      data.buffer,
-      data.byteOffset + startByte,
-      rowBytes,
-    );
-  }
+  const startByte = (j0 * N + i0) * VERTEX_BYTES;
+  const endByte = (j1 * N + i1 + 1) * VERTEX_BYTES;
+  device.queue.writeBuffer(
+    p.vertexBuffer,
+    startByte,
+    data.buffer,
+    data.byteOffset + startByte,
+    endByte - startByte,
+  );
 
   if (dirty.i0 <= 0) patchSideTop(device, p, 3, j0, j1);
   if (dirty.i1 >= N - 1) patchSideTop(device, p, 1, j0, j1);
