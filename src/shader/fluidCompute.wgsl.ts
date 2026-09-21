@@ -367,7 +367,7 @@ fn terrainRepulsionForce(pos: vec3<f32>, radius: f32) -> vec3<f32> {
   let ts = terrainSample(localPos.x, localPos.z);
   let n = ts.yzw;
   let perp = (localPos.y - (baseY + ts.x)) * n.y;
-  let d = max(perp - radius, -radius);       // distance past the contact plane
+  let d = max(perp - radius, -radius); 
   if (d >= radius) { return vec3<f32>(0.0); }
 
   let localForce = n * ((radius - d) / radius);
