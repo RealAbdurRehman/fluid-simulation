@@ -1,3 +1,10 @@
+:root {
+  --panel-bg: #1a1a1c;
+  --text: rgba(255, 255, 255, 0.88);
+  --text-dim: rgba(255, 255, 255, 0.55);
+  --hover: rgba(255, 255, 255, 0.05);
+}
+
 *,
 *::before,
 *::after {
@@ -10,40 +17,95 @@ body {
   background-color: #090b12;
 }
 
-#controls-overlay {
+li {
+  list-style: none;
+}
+
+#controls-drawer {
   position: fixed;
   bottom: 16px;
   left: 16px;
   z-index: 10;
-  color: #ffffff;
-  font-family:
-    system-ui,
-    -apple-system,
-    sans-serif;
-  font-size: 12px;
-  line-height: 1.6;
-  pointer-events: none;
-  user-select: none;
-}
 
-#controls-overlay .controls-title {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  margin-bottom: 6px;
-}
-
-#controls-overlay ul {
-  list-style: none;
-}
-
-#controls-overlay li {
+  width: 250px;
   display: flex;
-  gap: 10px;
+  flex-direction: column;
+
+  font-size: 0.7rem;
+  font-family: system-ui, sans-serif;
+  color: var(--text-dim);
+
+  user-select: none;
+  background-color: var(--panel-bg);
 }
 
-#controls-overlay li span {
-  min-width: 150px;
-  font-weight: 500;
+#controls-tab {
+  all: unset;
+  cursor: pointer;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 6px;
+
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+
+  transition:
+    color 0.15s,
+    border-radius 0.15s,
+    border-color 0.15s;
+}
+
+#controls-tab:focus-visible {
+  color: var(--text);
+  outline: 1px solid currentColor;
+}
+
+#controls-tab:hover {
+  color: var(--text);
+}
+
+.tab-arrow {
+  opacity: 0.7;
+  transition: transform 0.2s ease;
+}
+
+#controls-tab[aria-expanded="true"] .tab-arrow {
+  transform: rotate(180deg);
+}
+
+#controls-panel {
+  max-height: 0;
+  padding: 0;
+  opacity: 0;
+  overflow: hidden auto;
+
+  transition:
+    max-height 0.25s,
+    opacity 0.2s,
+    padding 0.25s;
+}
+
+#controls-panel.open {
+  padding: 0.38rem 0;
+  max-height: min(60vh, 460px);
+  opacity: 1;
+}
+
+.controls-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.25rem 0.75rem;
+}
+
+.controls-list li:hover {
+  color: var(--text);
+  background: var(--hover);
 }

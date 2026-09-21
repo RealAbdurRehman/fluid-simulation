@@ -8,27 +8,85 @@
       content="A realistic looking simulation of fluids on the web."
     />
     <title>Fluid Simulation</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/keyboard-css@1.2.4/dist/css/main.min.css"
+    />
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <div id="app"></div>
-    <div id="controls-overlay">
-      <div class="controls-title">Controls</div>
-      <ul>
-        <li><span>Left Click + Drag</span>Orbit camera</li>
-        <li><span>Scroll Wheel</span>Zoom in / out</li>
-        <li>
-          <span>Right Click + Drag</span>Grab fluid (or Shift + Left Click)
-        </li>
-        <li>
-          <span>Middle Click + Drag</span>Push fluid (or Ctrl + Left Click)
-        </li>
-        <li><span>V + Left Click</span>Vortex</li>
-        <li><span>B + Left Click</span>Sculpt terrain</li>
-        <li><span>Spacebar</span>Pause / Resume</li>
-        <li><span>Period</span>Step Once</li>
-        <li><span>R</span>Reset fluid</li>
-      </ul>
+    <div id="controls-drawer">
+      <button
+        id="controls-tab"
+        aria-expanded="false"
+        aria-controls="controls-panel"
+      >
+        Controls
+        <svg
+          class="tab-arrow"
+          width="10"
+          height="6"
+          viewBox="0 0 10 6"
+          aria-hidden="true"
+        >
+          <path
+            d="M1 5 L5 1 L9 5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      <div id="controls-panel" hidden>
+        <ul class="controls-list">
+          <li>
+            <kbd class="kbc-button kbc-button-sm">LMB</kbd
+            ><span>Orbit camera</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">Scroll</kbd
+            ><span>Zoom in / out</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">RMB</kbd
+            ><span>Grab fluid</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">MMB</kbd
+            ><span>Push fluid</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">Shift</kbd
+            ><span>+ LMB to grab</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">Ctrl</kbd
+            ><span>+ LMB to push</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">V</kbd
+            ><span>+ LMB vortex</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">B</kbd
+            ><span>+ LMB sculpt</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">Space</kbd
+            ><span>Pause / Resume</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">.</kbd><span>Step once</span>
+          </li>
+          <li>
+            <kbd class="kbc-button kbc-button-sm">R</kbd
+            ><span>Reset fluid</span>
+          </li>
+        </ul>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

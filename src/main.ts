@@ -34,6 +34,7 @@ async function bootstrap(): Promise<void> {
   const format = navigator.gpu.getPreferredCanvasFormat();
 
   const canvas = createCanvas();
+  setupControlsSection();
   const context = configureContext(canvas, device, format);
   const controls = attachControls(canvas);
 
@@ -586,6 +587,33 @@ function createCanvas(): HTMLCanvasElement {
   } satisfies Partial<CSSStyleDeclaration>);
   document.body.appendChild(canvas);
   return canvas;
+}
+
+function setupControlsSection(): void {
+  const tab = document.getElementById("controls-tab");
+  const panel = document.getElementById("controls-panel");
+  if (!tab || !panel) return;
+
+  tab.addEventListener("click", () => {
+    tab.blur();
+    const isOpen = tab.getAttribute("aria-expanded") === "true";
+    tab.setAttribute("aria-expanded", String(!isOpen));
+
+    if (isOpen) {
+      panel.classList.remove("open");
+      panel.addEventListener(
+        "transitionend",
+        () => {
+          if (tab.getAttribute("aria-expanded") === "false")
+            panel.hidden = true;
+        },
+        { once: true },
+      );
+    } else {
+      panel.hidden = false;
+      requestAnimationFrame(() => panel.classList.add("open"));
+    }
+  });
 }
 
 function configureContext(
