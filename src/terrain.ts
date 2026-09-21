@@ -8,6 +8,41 @@ export interface TerrainData {
   heights: Float32Array;
 }
 
+export interface DirtyRect {
+  i0: number;
+  j0: number;
+  i1: number;
+  j1: number;
+  active: boolean;
+}
+
+export function createDirtyRect(): DirtyRect {
+  return { i0: 0, j0: 0, i1: -1, j1: -1, active: false };
+}
+
+export function resetDirtyRect(d: DirtyRect): void {
+  d.i0 = 0;
+  d.j0 = 0;
+  d.i1 = -1;
+  d.j1 = -1;
+  d.active = false;
+}
+
+export function markDirty(d: DirtyRect, i: number, j: number): void {
+  if (!d.active) {
+    d.i0 = d.i1 = i;
+    d.j0 = d.j1 = j;
+    d.active = true;
+
+    return;
+  }
+
+  if (i < d.i0) d.i0 = i;
+  if (i > d.i1) d.i1 = i;
+  if (j < d.j0) d.j0 = j;
+  if (j > d.j1) d.j1 = j;
+}
+
 function hash2(x: number, y: number, seed: number): number {
   let h = (x | 0) * 374761393 + (y | 0) * 668265263 + (seed | 0) * 69069;
   h = (h ^ (h >> 13)) * 1274126177;
@@ -205,4 +240,207 @@ export function terrainToGeometry(
   geo.computeBoundingSphere();
 
   return geo;
+}
+
+const VERTEX_FLOATS = 8;
+const VERTEX_BYTES = VERTEX_FLOATS * 4;
+
+export interface TerrainMeshPatch {
+  vertexBuffer: GPUBuffer;
+  vertexData: Float32Array;
+  N: number;
+  cellX: number;
+  cellZ: number;
+  halfX: number;
+  halfZ: number;
+  baseY: number;
+  heightScale: number;
+  terrainRef: TerrainData;
+}
+
+function sampleTopY(p: TerrainMeshPatch, i: number, j: number): number {
+  const N = p.N;
+  const ii = Math.max(0, Math.min(N - 1, i));
+  const jj = Math.max(0, Math.min(N - 1, j));
+
+  return p.baseY + p.terrainRef.heights[jj * N + ii] * p.heightScale;
+}
+
+function writeVertex(p: TerrainMeshPatch, i: number, j: number): void {
+  const x = -p.halfX + i * p.cellX;
+  const z = -p.halfZ + j * p.cellZ;
+  const y = sampleTopY(p, i, j);
+
+  const dx =
+    (sampleTopY(p, i + 1, j) - sampleTopY(p, i - 1, j)) / (2 * p.cellX);
+  const dz =
+    (sampleTopY(p, i, j + 1) - sampleTopY(p, i, j - 1)) / (2 * p.cellZ);
+
+  let nx = -dx;
+  let ny = 1.0;
+  let nz = -dz;
+
+  const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+  nx /= len;
+  ny /= len;
+  nz /= len;
+
+  const o = (j * p.N + i) * VERTEX_FLOATS;
+  const d = p.vertexData;
+  d[o + 0] = x;
+  d[o + 1] = y;
+  d[o + 2] = z;
+  d[o + 3] = nx;
+  d[o + 4] = ny;
+  d[o + 5] = nz;
+}
+
+export function createTerrainMeshPatch(
+  vertexBuffer: GPUBuffer,
+  terrain: TerrainData,
+  baseY: number,
+): TerrainMeshPatch {
+  const N = terrain.resolution;
+  const p: TerrainMeshPatch = {
+    vertexBuffer,
+    vertexData: new Float32Array(N * N * VERTEX_FLOATS),
+    N,
+    cellX: terrain.extentX / (N - 1),
+    cellZ: terrain.extentZ / (N - 1),
+    halfX: terrain.extentX * 0.5,
+    halfZ: terrain.extentZ * 0.5,
+    baseY,
+    heightScale: terrain.heightScale,
+    terrainRef: terrain,
+  };
+
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) writeVertex(p, i, j);
+
+  return p;
+}
+
+function sideNormal(sideIdx: number): [number, number, number] {
+  switch (sideIdx) {
+    case 0:
+      return [0, 0, -1];
+    case 1:
+      return [1, 0, 0];
+    case 2:
+      return [0, 0, 1];
+    default:
+      return [-1, 0, 0];
+  }
+}
+
+function sideTopXZ(
+  p: TerrainMeshPatch,
+  sideIdx: number,
+  k: number,
+): [number, number] {
+  switch (sideIdx) {
+    case 0:
+      return [-p.halfX + k * p.cellX, -p.halfZ];
+    case 1:
+      return [p.halfX, -p.halfZ + k * p.cellZ];
+    case 2:
+      return [p.halfX - k * p.cellX, p.halfZ];
+    default:
+      return [-p.halfX, p.halfZ - k * p.cellZ];
+  }
+}
+
+function sideTopY(p: TerrainMeshPatch, sideIdx: number, k: number): number {
+  const N = p.N;
+  switch (sideIdx) {
+    case 0:
+      return sampleTopY(p, k, 0);
+    case 1:
+      return sampleTopY(p, N - 1, k);
+    case 2:
+      return sampleTopY(p, N - 1 - k, N - 1);
+    default:
+      return sampleTopY(p, 0, N - 1 - k);
+  }
+}
+
+function patchSideTop(
+  device: GPUDevice,
+  p: TerrainMeshPatch,
+  sideIdx: number,
+  lo: number,
+  hi: number,
+): void {
+  const N = p.N;
+
+  let kLo: number, kHi: number;
+  if (sideIdx === 2 || sideIdx === 3) {
+    kLo = N - 1 - hi;
+    kHi = N - 1 - lo;
+  } else {
+    kLo = lo;
+    kHi = hi;
+  }
+
+  kLo = Math.max(0, kLo);
+  kHi = Math.min(N - 1, kHi);
+  if (kHi < kLo) return;
+
+  const n = sideNormal(sideIdx);
+  const count = kHi - kLo + 1;
+
+  const scratch = new Float32Array(count * VERTEX_FLOATS);
+  for (let k = kLo; k <= kHi; k++) {
+    const xz = sideTopXZ(p, sideIdx, k);
+    const y = sideTopY(p, sideIdx, k);
+
+    const o = (k - kLo) * VERTEX_FLOATS;
+    scratch[o + 0] = xz[0];
+    scratch[o + 1] = y;
+    scratch[o + 2] = xz[1];
+    scratch[o + 3] = n[0];
+    scratch[o + 4] = n[1];
+    scratch[o + 5] = n[2];
+    scratch[o + 6] = 0;
+    scratch[o + 7] = 0;
+  }
+
+  const sideStartVert = N * N + 4 + sideIdx * 2 * N;
+  const startFloat = (sideStartVert + kLo) * VERTEX_FLOATS;
+  device.queue.writeBuffer(p.vertexBuffer, startFloat * 4, scratch);
+}
+
+export function patchTerrainMesh(
+  device: GPUDevice,
+  p: TerrainMeshPatch,
+  dirty: DirtyRect,
+): void {
+  if (!dirty.active) return;
+  const N = p.N;
+
+  const i0 = Math.max(0, dirty.i0 - 1);
+  const j0 = Math.max(0, dirty.j0 - 1);
+  const i1 = Math.min(N - 1, dirty.i1 + 1);
+  const j1 = Math.min(N - 1, dirty.j1 + 1);
+  if (i1 < i0 || j1 < j0) return;
+
+  for (let j = j0; j <= j1; j++)
+    for (let i = i0; i <= i1; i++) writeVertex(p, i, j);
+
+  const data = p.vertexData;
+  const rowBytes = (i1 - i0 + 1) * VERTEX_BYTES;
+  for (let j = j0; j <= j1; j++) {
+    const startByte = (j * N + i0) * VERTEX_FLOATS * 4;
+    device.queue.writeBuffer(
+      p.vertexBuffer,
+      startByte,
+      data.buffer,
+      data.byteOffset + startByte,
+      rowBytes,
+    );
+  }
+
+  if (dirty.i0 <= 0) patchSideTop(device, p, 3, j0, j1);
+  if (dirty.i1 >= N - 1) patchSideTop(device, p, 1, j0, j1);
+  if (dirty.j0 <= 0) patchSideTop(device, p, 0, i0, i1);
+  if (dirty.j1 >= N - 1) patchSideTop(device, p, 2, i0, i1);
 }

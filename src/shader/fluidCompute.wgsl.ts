@@ -581,7 +581,7 @@ fn resolveTerrain(
   var localVel = qRotateVec(invRot, velIn - container.velocity.xyz);
 
   let baseY = -params.boundsHeight * 0.5;
-  let maxTerrainTop = baseY + params.terrainMeta.z + radius;
+  let maxTerrainTop = baseY + params.vortexFalloff.y * params.terrainMeta.z + radius;
   if (localPos.y >= maxTerrainTop) {
     return r;
   }
@@ -601,9 +601,13 @@ fn resolveTerrain(
   let n = normalize(vec3<f32>(-dxH * epsZ, 2.0 * epsX * epsZ, -dzH * epsX));
 
   let signedDist = localPos.y - surfY;
-  if (signedDist < radius) {
-    let push = radius - signedDist;
-    localPos += n * push;
+  let perpDist = signedDist * n.y;
+  if (perpDist < radius) {
+    if (signedDist < 0.0) {
+      localPos.y = surfY + radius;
+    } else {
+      localPos += n * (radius - perpDist);
+    }
 
     let vn = dot(localVel, n);
     if (vn < 0.0) {

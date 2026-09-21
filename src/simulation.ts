@@ -145,6 +145,7 @@ export class FluidSimulationGPU {
   private terrainBuffer!: GPUBuffer;
   private terrainMeta = new Float32Array([0, 0, 0, 0]);
   private terrainExtentZ = 0;
+  private terrainMaxH = 1;
 
   private meshBakeCache = new Map<string, BakedMeshHandle>();
   private meshBakePromises = new Map<string, Promise<BakedMeshHandle>>();
@@ -678,11 +679,51 @@ export class FluidSimulationGPU {
       N * N * 4,
     );
 
+    let m = 0;
+    for (let k = 0; k < N * N; k++) if (t.heights[k] > m) m = t.heights[k];
+    this.terrainMaxH = Math.max(m, 1e-3);
+
     this.terrainMeta[0] = N;
     this.terrainMeta[1] = t.extentX;
     this.terrainMeta[2] = t.heightScale;
     this.terrainMeta[3] = 1;
     this.terrainExtentZ = t.extentZ;
+  }
+  public updateTerrainRegion(
+    t: TerrainData,
+    i0: number,
+    j0: number,
+    i1: number,
+    j1: number,
+  ): void {
+    if (this.terrainMeta[3] < 0.5) return;
+
+    const N = Math.min(t.resolution, TERRAIN_MAX_RESOLUTION);
+
+    i0 = Math.max(0, i0);
+    j0 = Math.max(0, j0);
+    i1 = Math.min(N - 1, i1);
+    j1 = Math.min(N - 1, j1);
+
+    if (i1 < i0 || j1 < j0) return;
+
+    for (let j = j0; j <= j1; j++)
+      for (let i = i0; i <= i1; i++) {
+        const h = t.heights[j * N + i];
+        if (h > this.terrainMaxH) this.terrainMaxH = h;
+      }
+
+    const colBytes = (i1 - i0 + 1) * 4;
+    for (let j = j0; j <= j1; j++) {
+      const byteOff = (j * N + i0) * 4;
+      this.device.queue.writeBuffer(
+        this.terrainBuffer,
+        byteOff,
+        t.heights.buffer,
+        t.heights.byteOffset + byteOff,
+        colBytes,
+      );
+    }
   }
   private updateGridConfig(): void {
     const S = Math.max(
@@ -772,7 +813,7 @@ export class FluidSimulationGPU {
     f32[35] = config.vortexLift;
 
     f32[36] = config.vortexFalloff;
-    f32[37] = 0.0;
+    f32[37] = this.terrainMaxH;
     f32[38] = 0.0;
     f32[39] = 0.0;
 

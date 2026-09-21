@@ -7,7 +7,17 @@ import { SSFRRenderer } from "./ssfrRenderer";
 import { camera, attachControls, resizeCamera } from "./scene";
 import { MeshRegistry } from "./meshRegistry";
 import { createSimUpdaters } from "./simUpdaters";
-import { generateTerrain, terrainToGeometry } from "./terrain";
+import {
+  generateTerrain,
+  terrainToGeometry,
+  createTerrainMeshPatch,
+  patchTerrainMesh,
+  createDirtyRect,
+  resetDirtyRect,
+  type TerrainData,
+  type TerrainMeshPatch,
+} from "./terrain";
+import { createSculptState, raycastTerrain, sculptFrame } from "./sculpt";
 import { AudioEngine } from "./audio/audioEngine";
 import { FluidStatsGPU } from "./audio/fluidStats";
 import { SplashDetector } from "./audio/splashDetector";
@@ -62,14 +72,75 @@ async function bootstrap(): Promise<void> {
     audio,
   );
 
+  const heldKeys = new Set<string>();
+
+  function isTypingTarget(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (isTypingTarget(e.target)) return;
+    heldKeys.add(e.code);
+  });
+  window.addEventListener("keyup", (e) => {
+    heldKeys.delete(e.code);
+  });
+  window.addEventListener("blur", () => {
+    heldKeys.clear();
+  });
+
+  const isSculpting = (): boolean =>
+    config.sculpt.enabled && heldKeys.has("KeyB");
+
   let terrainMeshCounter = 0;
+  let terrainData: TerrainData | null = null;
+  let terrainBaseY = 0;
+  let terrainPatch: TerrainMeshPatch | null = null;
+
+  const sculptState = createSculptState();
+  const sculptDirty = createDirtyRect();
+  const sculptNDC = new THREE.Vector2(0, 0);
+  const sculptRaycaster = new THREE.Raycaster();
+
+  function sampleTerrainNormalized(x: number, z: number): number {
+    if (!terrainData) return 0;
+    const N = terrainData.resolution;
+    const halfX = terrainData.extentX * 0.5;
+    const halfZ = terrainData.extentZ * 0.5;
+    const cellX = terrainData.extentX / (N - 1);
+    const cellZ = terrainData.extentZ / (N - 1);
+
+    const u = Math.max(0, Math.min(N - 1, (x + halfX) / cellX));
+    const v = Math.max(0, Math.min(N - 1, (z + halfZ) / cellZ));
+
+    const i0 = Math.floor(u);
+    const j0 = Math.floor(v);
+    const i1 = Math.min(i0 + 1, N - 1);
+    const j1 = Math.min(j0 + 1, N - 1);
+    const fx = u - i0;
+    const fy = v - j0;
+
+    const h00 = terrainData.heights[j0 * N + i0];
+    const h10 = terrainData.heights[j0 * N + i1];
+    const h01 = terrainData.heights[j1 * N + i0];
+    const h11 = terrainData.heights[j1 * N + i1];
+
+    return (
+      (h00 * (1 - fx) + h10 * fx) * (1 - fy) + (h01 * (1 - fx) + h11 * fx) * fy
+    );
+  }
 
   function regenerateTerrain(): void {
+    terrainData = null;
+    terrainPatch = null;
+
     if (!config.terrainEnabled) {
       simulation.setTerrain(null);
       sceneRenderer.setTerrainMesh(null);
       updaters.setTerrain(null, 0);
-
       return;
     }
 
@@ -82,12 +153,18 @@ async function bootstrap(): Promise<void> {
       config.terrainSeed,
     );
 
+    terrainData = data;
+    terrainBaseY = baseY;
+
     simulation.setTerrain(data);
     updaters.setTerrain(data, baseY);
 
     const id = `terrain_${terrainMeshCounter++}`;
     meshRegistry.registerTerrain(id, terrainToGeometry(data, baseY));
     sceneRenderer.setTerrainMesh(id);
+
+    const vbuf = sceneRenderer.getMeshVertexBuffer(id);
+    terrainPatch = vbuf ? createTerrainMeshPatch(vbuf, data, baseY) : null;
   }
 
   setupGUI(
@@ -114,12 +191,57 @@ async function bootstrap(): Promise<void> {
   }
 
   const viewState = createViewState();
+
   const interaction = setupInteraction({
     canvas,
     camera,
     controls,
     simulation,
     audio,
+    isSculpting,
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    sculptNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    sculptNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  });
+
+  canvas.addEventListener("mousedown", (e) => {
+    if (!isSculpting()) return;
+    if (e.button !== 0) return;
+    if (!terrainData) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    sculptState.mode = config.sculpt.mode;
+    sculptState.active = true;
+    sculptState.hasLast = false;
+    sculptState.cursorValid = false;
+
+    if (sculptState.mode === "flatten") {
+      sculptRaycaster.setFromCamera(sculptNDC, camera);
+      const hit = raycastTerrain(
+        sculptRaycaster.ray.origin,
+        sculptRaycaster.ray.direction,
+        simulation.getBoundsQuaternion(),
+        terrainData,
+        terrainBaseY,
+      );
+      if (hit) {
+        sculptState.flattenTarget = sampleTerrainNormalized(hit.x, hit.z);
+      }
+    }
+
+    controls.enabled = false;
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!sculptState.active) return;
+    sculptState.active = false;
+    sculptState.hasLast = false;
+    if (isSculpting()) controls.enabled = true;
   });
 
   function resize(): void {
@@ -166,6 +288,49 @@ async function bootstrap(): Promise<void> {
     camera.updateMatrixWorld();
     viewState.update(camera);
     updaters.setListenerPosition(camera.position);
+
+    if (isSculpting() && terrainData && terrainPatch) {
+      sculptRaycaster.setFromCamera(sculptNDC, camera);
+      const hit = raycastTerrain(
+        sculptRaycaster.ray.origin,
+        sculptRaycaster.ray.direction,
+        simulation.getBoundsQuaternion(),
+        terrainData,
+        terrainBaseY,
+      );
+
+      if (hit) {
+        sculptState.cursorX = hit.x;
+        sculptState.cursorZ = hit.z;
+        sculptState.cursorValid = true;
+      } else {
+        sculptState.cursorValid = false;
+        sculptState.hasLast = false;
+      }
+
+      sculptState.radius = config.sculpt.radius;
+      sculptState.strength = config.sculpt.strength;
+      sculptState.minHeight = config.sculpt.minHeight;
+      sculptState.maxHeight = config.sculpt.maxHeight;
+
+      sculptFrame(sculptState, terrainData, frameDelta, sculptDirty);
+
+      if (sculptDirty.active) {
+        simulation.updateTerrainRegion(
+          terrainData,
+          sculptDirty.i0,
+          sculptDirty.j0,
+          sculptDirty.i1,
+          sculptDirty.j1,
+        );
+        patchTerrainMesh(device, terrainPatch, sculptDirty);
+        resetDirtyRect(sculptDirty);
+      }
+    } else if (sculptState.active) {
+      sculptState.active = false;
+      sculptState.hasLast = false;
+      if (controls.enabled === false) controls.enabled = true;
+    }
 
     const encoder = device.createCommandEncoder();
 
@@ -479,14 +644,17 @@ function createViewState() {
   return { view, proj, viewProj, cameraRight, cameraUp, update };
 }
 
-function setupInteraction(args: {
+interface SetupInteractionArgs {
   canvas: HTMLCanvasElement;
   camera: THREE.PerspectiveCamera;
   controls: ReturnType<typeof attachControls>;
   simulation: FluidSimulationGPU;
   audio: SimAudio;
-}) {
-  const { canvas, camera, controls, simulation, audio } = args;
+  isSculpting?: () => boolean;
+}
+
+function setupInteraction(args: SetupInteractionArgs) {
+  const { canvas, camera, controls, simulation, audio, isSculpting } = args;
 
   const mouse = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
@@ -517,6 +685,7 @@ function setupInteraction(args: {
   }
 
   function resolveMouseMode(e: MouseEvent): "push" | "pull" | "vortex" | null {
+    if (isSculpting && isSculpting()) return null;
     if (e.button === 1) return "pull";
     if (e.button === 2) return "push";
 

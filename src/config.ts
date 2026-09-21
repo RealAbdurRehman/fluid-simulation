@@ -92,6 +92,19 @@ function makeObjectSlot(
   };
 }
 
+export const SCULPT_MODES = ["raise", "lower", "smooth", "flatten"] as const;
+export type SculptMode = (typeof SCULPT_MODES)[number];
+
+export interface SculptConfig {
+  enabled: boolean;
+  mode: SculptMode;
+  radius: number;
+  strength: number;
+  spacing: number;
+  minHeight: number;
+  maxHeight: number;
+}
+
 const modelIdControllers: Controller[] = [];
 
 export const config = {
@@ -254,6 +267,16 @@ export const config = {
   terrainResolution: 128,
   terrainHeightScale: 2.5,
   terrainSeed: 1,
+
+  sculpt: {
+    enabled: true,
+    mode: "raise",
+    radius: 2.0,
+    strength: 3.0,
+    spacing: 0.35,
+    minHeight: 0.0,
+    maxHeight: 2.0,
+  } as SculptConfig,
 };
 
 export function setupGUI(
@@ -274,6 +297,7 @@ export function setupGUI(
   addInteractionFolder(gui);
   addAudioFolder(gui);
   addSceneFolder(gui, onUpdateBounds, onRegenerateTerrain);
+  addSculptFolder(gui);
   addObjectFolders(gui, onObjectChanged, onSpawnObject);
   addCustomModelFolder(gui);
 
@@ -416,6 +440,24 @@ function addSceneFolder(
     .add(config, "boundsDepth", 4, 40, 1)
     .name("Depth")
     .onChange(onUpdateBounds);
+}
+
+function addSculptFolder(gui: GUI): void {
+  const folder = gui.addFolder("Sculpt");
+
+  folder.add(config.sculpt, "mode", SCULPT_MODES).name("Brush Mode").listen();
+  folder
+    .add(config.sculpt, "radius", 0.5, 12, 0.1)
+    .name("Brush Radius")
+    .listen();
+  folder
+    .add(config.sculpt, "strength", 0.5, 20, 0.1)
+    .name("Brush Strength")
+    .listen();
+
+  const limits = folder.addFolder("Height Limits");
+  limits.add(config.sculpt, "minHeight", 0, 1, 0.05).name("Min").listen();
+  limits.add(config.sculpt, "maxHeight", 1, 4, 0.05).name("Max").listen();
 }
 
 function addObjectFolders(

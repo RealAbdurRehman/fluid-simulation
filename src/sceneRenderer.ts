@@ -1227,6 +1227,9 @@ export class SceneRenderer {
   public getMSAAView(): GPUTextureView {
     return this.msaaTexture.createView();
   }
+  public getMeshVertexBuffer(id: string): GPUBuffer | null {
+    return this.meshRegistry.get(id)?.vertex ?? null;
+  }
   public updateFrame(
     viewProjMatrix: Float32Array,
     cameraPos: [number, number, number],
